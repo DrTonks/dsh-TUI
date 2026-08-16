@@ -1915,15 +1915,26 @@ export function Chat({
             />
           </Box>
         ) : questionSnapshot !== null ? (
-          <AskUserQuestionPanel
-            key={questionSnapshot.key}
-            question={questionSnapshot.question}
-            position={questionSnapshot.position}
-            total={questionSnapshot.total}
-            answered={questionSnapshot.answered}
-            onAnswer={selection => questionStore.answerCurrent(selection)}
-            onCancel={() => questionStore.cancelCurrent()}
-          />
+          <>
+            {/* Keep the empty PromptInput's four-row seat while the question
+                floats over it. An in-flow questionnaire changes the whole
+                inline frame height; a tall first question then pushes the
+                splash into scrollback and the following short question paints
+                another copy into the viewport during shrink recovery. */}
+            <Box height={3} marginTop={1} width="100%">
+              <OverlayAbove bottom={0} maxHeight={Math.max(terminalRows - 2, 8)}>
+                <AskUserQuestionPanel
+                  key={questionSnapshot.key}
+                  question={questionSnapshot.question}
+                  position={questionSnapshot.position}
+                  total={questionSnapshot.total}
+                  answered={questionSnapshot.answered}
+                  onAnswer={selection => questionStore.answerCurrent(selection)}
+                  onCancel={() => questionStore.cancelCurrent()}
+                />
+              </OverlayAbove>
+            </Box>
+          </>
         ) : (
           <PromptInput
             channel={channel}
