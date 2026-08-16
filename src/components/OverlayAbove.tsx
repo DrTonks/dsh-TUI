@@ -17,15 +17,18 @@ import { Box } from '../ui.js'
 export function OverlayAbove({
   children,
   maxHeight,
+  bottom = '100%',
 }: {
   children: React.ReactNode
   /** 防止面板高过可用区域时探出帧顶（短会话 + 高列表）。 */
   maxHeight?: number | undefined
+  /** 面板底边相对锚点的位置；默认浮在锚点上方。 */
+  bottom?: number | `${number}%` | undefined
 }): React.ReactNode {
   return (
     <Box
       position="absolute"
-      bottom="100%"
+      bottom={bottom}
       left={0}
       right={0}
       flexDirection="column"
