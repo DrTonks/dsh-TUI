@@ -14,13 +14,14 @@
 
 import React from 'react'
 import { t } from '../../i18n.js'
-import { Box, Text, useInput } from '../../ui.js'
+import { Box, Text, useInput, useTerminalSize } from '../../ui.js'
 import { useDeclaredCursor } from '../../ink/hooks/use-declared-cursor.js'
 import { Divider } from '../design-system/Divider.js'
 import { POINTER } from '../../cc/figures.js'
 import type { QuestionSelection } from '../../dsh-adapter/questions.js'
 import { PlanReviewPanel } from './PlanReviewPanel.js'
 import { isPlainReturnInput } from '../../utils/modifiers.js'
+import { listWindow } from '../listWindow.js'
 
 const CHECKED = '◉'
 const UNCHECKED = '○'
@@ -70,6 +71,7 @@ export function AskUserQuestionPanel({
   const options = question.options ?? []
   const multiSelect = question.multiSelect === true
   const hideCustomInput = question.hideCustomInput === true && options.length > 0
+  const { rows: terminalRows } = useTerminalSize()
   /** Rows: the real options plus the inline input row at the tail. */
   const rowCount = options.length + (hideCustomInput ? 0 : 1)
   const [focusIndex, setFocusIndex] = React.useState(0)
@@ -82,6 +84,24 @@ export function AskUserQuestionPanel({
   const [error, setError] = React.useState<string | null>(null)
 
   const inputFocused = !hideCustomInput && focusIndex === options.length
+  // Chat chrome + panel scaffolding consume twelve rows before the option
+  // list: status line, outer/divider/question/list/hint spacing and content.
+  // Optional header/detail/input/error rows are charged explicitly. Long
+  // lists then use fixed one/two-line rows so listWindow's budget is exact;
+  // short questionnaires retain their existing wrapped presentation.
+  const detailRows = question.detail === undefined ? 0 : question.detail.split('\n').length + 1
+  const reservedRows = 12
+    + (question.header === undefined ? 0 : 1)
+    + detailRows
+    + (hideCustomInput ? 0 : 1)
+    + (error === null ? 0 : 2)
+  const optionBudget = Math.max(terminalRows - reservedRows, 2)
+  const optionHeights = options.map(option => option.description === undefined ? 1 : 2)
+  const windowedOptions = optionHeights.reduce((sum, height) => sum + height, 0) > optionBudget
+  const optionFocus = Math.min(focusIndex, Math.max(options.length - 1, 0))
+  const optionWindow = windowedOptions
+    ? listWindow(optionHeights, optionFocus, optionBudget)
+    : { start: 0, end: options.length }
 
   // Park the native terminal cursor on the custom-answer caret: terminal
   // emulators render IME preedit (pinyin) at the physical cursor, so without
@@ -299,14 +319,30 @@ export function AskUserQuestionPanel({
 
   const renderOptions = (): React.ReactNode => (
     <Box flexDirection="column" marginTop={1}>
-      {options.map((option, index) => {
-        const focused = index === focusIndex
-        const selected = multiSelect ? checked.has(index) : focused
+      {options.slice(optionWindow.start, optionWindow.end).map((option, index) => {
+        const absoluteIndex = optionWindow.start + index
+        const focused = absoluteIndex === focusIndex
+        const selected = multiSelect ? checked.has(absoluteIndex) : focused
+        const pointer = focused
+          ? POINTER
+          : absoluteIndex === optionWindow.start && optionWindow.start > 0
+            ? '↑'
+            : absoluteIndex === optionWindow.end - 1 && optionWindow.end < options.length
+              ? '↓'
+              : ' '
+        const label = windowedOptions ? option.label.replace(/\s+/gu, ' ').trim() : option.label
+        const description = windowedOptions
+          ? option.description?.replace(/\s+/gu, ' ').trim()
+          : option.description
         return (
-          <Box key={option.label} flexDirection="row" marginTop={focused ? 1 : 0}>
+          <Box
+            key={`${absoluteIndex}:${option.label}`}
+            flexDirection="row"
+            marginTop={!windowedOptions && focused ? 1 : 0}
+          >
             <Box width={1} flexShrink={0}>
               <Text color={focused ? 'claude' : undefined} bold={focused}>
-                {focused ? POINTER : ' '}
+                {pointer}
               </Text>
             </Box>
             <Box width={1} flexShrink={0}>
@@ -315,12 +351,16 @@ export function AskUserQuestionPanel({
               </Text>
             </Box>
             <Box flexDirection="column" marginLeft={1}>
-              <Text bold={focused || selected} color={focused ? 'claude' : undefined} wrap="wrap">
-                {option.label}
+              <Text
+                bold={focused || selected}
+                color={focused ? 'claude' : undefined}
+                wrap={windowedOptions ? 'truncate' : 'wrap'}
+              >
+                {label}
               </Text>
-              {option.description !== undefined && (
-                <Text dimColor wrap="wrap">
-                  {option.description}
+              {description !== undefined && (
+                <Text dimColor wrap={windowedOptions ? 'truncate' : 'wrap'}>
+                  {description}
                 </Text>
               )}
             </Box>

@@ -179,7 +179,9 @@ export async function runProviderWizard(
           questions: [optionQuestion('catalog', t('provider-q-catalog'), [
             ...candidates.map(candidate => ({
               label: candidate.provider,
-              description: candidate.displayName,
+              description: candidate.displayName === candidate.provider
+                ? undefined
+                : candidate.displayName,
             })),
             { label: otherLabel, description: t('provider-opt-other-route-desc') },
           ], { hideCustomInput: true })],

@@ -61,11 +61,14 @@ function makeDeps(script, options = {}) {
     asks: [],
     /** question id → hideCustomInput flag as submitted (panel contract). */
     hideFlags: {},
+    /** question id → option descriptions, for catalog row-shape regressions. */
+    optionDescriptions: {},
   }
   const host = {
     listCatalogProviders: () => [
       { provider: 'deepseek', displayName: 'DeepSeek' },
       { provider: 'openai', displayName: 'OpenAI' },
+      { provider: 'same-name', displayName: 'same-name' },
     ],
     routeExists: () => false,
     discoverModels: async () => {
@@ -91,6 +94,9 @@ function makeDeps(script, options = {}) {
       for (const question of request.questions) {
         calls.asks.push(question.id)
         calls.hideFlags[question.id] = question.hideCustomInput === true
+        calls.optionDescriptions[question.id] = Object.fromEntries(
+          (question.options ?? []).map(option => [option.label, option.description]),
+        )
         const spec = script[question.id]
         if (spec === undefined) throw new Error(`unscripted question: ${question.id}`)
         if (spec === 'cancel') throw CANCEL
@@ -374,6 +380,9 @@ const KEEP_MODEL = { selected: [t('provider-opt-switch-keep')] }
       'switch': true,
     }),
     JSON.stringify(catalog.calls.hideFlags))
+  check('12 catalog omits a duplicate display name',
+    catalog.calls.optionDescriptions.catalog?.['same-name'] === undefined,
+    JSON.stringify(catalog.calls.optionDescriptions.catalog))
 
   const custom = makeDeps({
     'mode': MODE_CUSTOM,
