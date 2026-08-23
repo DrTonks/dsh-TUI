@@ -7,6 +7,7 @@ import renderNodeToOutput, {
   createRenderContext,
   createRendererState,
   resetAbsoluteRecomposePass,
+  resetRenderTransients,
 } from './render-node-to-output.js'
 import { createScreen, type StylePool } from './screen.js'
 
@@ -121,6 +122,7 @@ export default function createRenderer(
     }
 
     const renderContext = createRenderContext(rendererState)
+    resetRenderTransients()
 
     // prevFrameContaminated: selection overlay mutated the returned screen
     // buffer post-render (in ink.tsx), resetFramesForAltScreen() replaced it

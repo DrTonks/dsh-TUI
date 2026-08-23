@@ -20,16 +20,17 @@ import { readModelPref } from '../modelPrefs.js'
 import { explicitModelRoute, recordedModelRoute, resolveModelRoute, validateModelRoute } from '../modelRoute.js'
 import type { ModelRoute } from '../modelRoute.js'
 import { readPresetPref } from '../presetPrefs.js'
-import { composePreset, filterMinimalPresetTools, resolvePersistedPreset, runningPresetOf } from './presets.js'
+import { composePreset, filterMinimalPresetTools, resolvePersistedPreset, resolvePersistedRoute, runningPresetOf } from './presets.js'
 import { ensurePackagedPresets } from './packaged-presets.js'
 import { ensureLegacySessionEventTypes } from './compat/index.js'
 import { clearResumeTarget, writeResumeTarget } from '../sessionHistory.js'
 import { resolveSessionCwd } from '../utils/workspaceRoot.js'
 import { checkForTuiUpdate, installedTuiVersion, isBootDeadlockTarget, isVersionNewer, resolveDshProfileName, resolveTuiUpdateTarget, updateTuiAndRestart } from '../update.js'
 import { getLang, isLang, resolveStartupLang, setLang, t, writeLangPref } from '../i18n.js'
-import { DEFAULT_STATUS_BAR, normalizeStatusBar, normalizeToolBackground, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import { DEFAULT_STATUS_BAR, normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
 import { detectLegacyEnv, migrateLegacyDataDir, RENAMED_ENV } from '../utils/paths.js'
 import { attachHerdrIntegration } from '../herdr.js'
+import { logMouseDebug } from '../utils/debug.js'
 import { Chat } from '../screens/Chat.js'
 import { getHostDialogStore, type TuiDialogRuntime } from './dialogs.js'
 import { getHostStatusStore, type TuiStatusRuntime } from './status.js'
@@ -53,6 +54,20 @@ import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, supportsTabStatus, wrapForMult
  * `dsh-jsonrpc`: the surrounding `cordis.yml` supplies the agent spine, the
  * LLM adapter, and the tool plugins.
  */
+/**
+ * Fullscreen decision latched across host recomposes. The launcher disposes
+ * and re-mounts the plugin tree (teardown → apply() runs again) — a fresh
+ * apply() re-resolves `bootedFullscreen` from cordis config, and the
+ * settings user layer (settings.yaml) can arrive after the 300ms
+ * `settingsReady` bound when the recompose is also re-mounting the settings
+ * service. The tree would then mount INLINE and `fullscreenFrozen` would
+ * swallow the late application — the app lands on the main screen
+ * ("exited fullscreen", dead mouse, unpinned input) until restart. A
+ * session that already mounted fullscreen must never regress on a
+ * recompose: latch the decision.
+ */
+let lastBootedFullscreen: boolean | undefined
+
 export async function apply(ctx: Context, config: Config): Promise<void> {
   if (!process.stdout.isTTY) {
     throw new Error('dsh-tui requires an interactive terminal (stdout must be a TTY).')
@@ -364,8 +379,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     diffLayout: config.diffLayout,
     thinkingFold: config.thinkingFold,
     toolBackground: config.toolBackground,
+    scrollGutter: config.scrollGutter,
     statusBar: config.statusBar,
     handle,
+  })
+  // Fullscreen layout decision: the settings user layer (edited through the
+  // /settings screen) overrides cordis.yml when set. The settings injection
+  // below resolves it synchronously when the host settings service is up —
+  // i.e. before the tree mounts. `fullscreenFrozen` latches at mount: the
+  // exit funnel and the AlternateScreen wrap must keep reading the mode this
+  // session ACTUALLY runs, never a mid-session edit meant for the next boot
+  // (swapping layouts requires re-mounting the whole tree).
+  let bootedFullscreen = config.fullscreen === true
+  let fullscreenFrozen = false
+  // The settings service may come up AFTER this plugin's apply: the cordis
+  // inject callback defers until the service registers, so the first
+  // `apply(scope.get())` below can land after the mount (field report: the
+  // /settings fullscreen toggle never took effect — the frozen latch below
+  // swallowed the late callback and bootedFullscreen stayed false). The
+  // mount must therefore WAIT for the first settings application (bounded —
+  // a bare embedder without a settings service must not deadlock).
+  let resolveSettingsReady: (() => void) | undefined
+  const settingsReady = new Promise<void>(resolve => {
+    resolveSettingsReady = () => resolve()
+    setTimeout(resolve, 300)
   })
   // Register the dsh-tui settings namespace so the /settings screen can
   // edit it (the section below was '命名空间未注册' without this): the
@@ -378,6 +415,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         diffLayout: Schema.union(['auto', 'split', 'unified']).default('auto'),
         thinkingFold: Schema.union(['preview', 'full']).default('preview'),
         toolBackground: Schema.union(['none', 'subtle', 'strong']).default('none'),
+        scrollGutter: Schema.union(['timeline', 'scrollbar', 'hidden']).default('timeline'),
         statusBar: Schema.object({
           compact: Schema.boolean().default(DEFAULT_STATUS_BAR.compact),
           model: Schema.boolean().default(DEFAULT_STATUS_BAR.model),
@@ -389,6 +427,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           tps: Schema.boolean().default(DEFAULT_STATUS_BAR.tps),
           gitBranch: Schema.boolean().default(DEFAULT_STATUS_BAR.gitBranch),
           sessionTitle: Schema.boolean().default(DEFAULT_STATUS_BAR.sessionTitle),
+          sessionId: Schema.boolean().default(DEFAULT_STATUS_BAR.sessionId),
+          goal: Schema.boolean().default(DEFAULT_STATUS_BAR.goal),
           mode: Schema.boolean().default(DEFAULT_STATUS_BAR.mode),
           contextBar: Schema.boolean().default(DEFAULT_STATUS_BAR.contextBar),
           activity: Schema.boolean().default(DEFAULT_STATUS_BAR.activity),
@@ -397,18 +437,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }).default({ ...DEFAULT_STATUS_BAR }),
         // Header pixel whale art; on unless settings.yaml says otherwise.
         whale: Schema.boolean().default(true),
+        // Minimal mode: strips the header splash, emoji glyphs, and
+        // decorative colors; code highlight and tool colors stay.
+        minimal: Schema.boolean().default(false),
         // No default on purpose: an unset `lang` keeps the field showing
         // the effective language (see the section's format below) and lets
         // cordis.yml / lang.json keep their precedence.
         lang: Schema.union(['zh', 'en']),
+        // Same no-default rule: unset keeps cordis.yml's `fullscreen`
+        // decisive; set overrides it from the next boot on.
+        fullscreen: Schema.boolean(),
       }),
     )
     type SettingsValue = {
       diffLayout?: 'auto' | 'split' | 'unified'
       lang?: 'zh' | 'en'
       whale?: boolean
+      minimal?: boolean
+      fullscreen?: boolean
       thinkingFold?: 'preview' | 'full'
       toolBackground?: ToolBackground
+      scrollGutter?: ScrollGutterMode
       statusBar?: Partial<StatusBarConfig>
     }
     const applyLayout = (value: SettingsValue): void => {
@@ -416,6 +465,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     const applyWhale = (value: { whale?: boolean }): void => {
       channel.setWhale(value.whale ?? true)
+    }
+    const applyMinimal = (value: { minimal?: boolean }): void => {
+      channel.setMinimal(value.minimal ?? false)
+    }
+    // Fullscreen: only meaningful before the tree mounts (the freeze latch
+    // above). A later doc change (mid-session /settings edit) is persisted
+    // by the service and picked up on the next boot; the watch below says
+    // so with a notify.
+    const applyFullscreen = (value: SettingsValue): void => {
+      if (!fullscreenFrozen && typeof value.fullscreen === 'boolean') {
+        bootedFullscreen = value.fullscreen
+      }
     }
     // The /settings language field writes `lang` through the settings
     // service (user layer): apply it live and mirror it to lang.json so
@@ -433,18 +494,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const applyDisplay = (value: SettingsValue): void => {
       channel.setThinkingFold(value.thinkingFold ?? config.thinkingFold ?? 'preview')
       channel.setToolBackground(normalizeToolBackground(value.toolBackground ?? config.toolBackground))
+      channel.setScrollGutter(normalizeScrollGutter(value.scrollGutter ?? config.scrollGutter))
       channel.setStatusBar(normalizeStatusBar(value.statusBar ?? config.statusBar))
     }
     const apply = (next: SettingsValue): void => {
       applyLayout(next)
       applyWhale(next)
+      applyMinimal(next)
       applyLang(next)
       applyDisplay(next)
+      applyFullscreen(next)
     }
     apply(scope.get())
     scope.watch(next => {
       apply(next)
+      if (typeof next.fullscreen === 'boolean' && next.fullscreen !== bootedFullscreen) {
+        channel.notify(t('settings-fullscreen-restart'), { color: 'warning' })
+      }
     })
+    resolveSettingsReady?.()
   })
   // The /settings screen's own section: the dsh-tui namespace comes from
   // the settings registration above, and the declared selects write `lang`
@@ -475,6 +543,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             // (env / cordis.yml / lang.json resolution) instead of a
             // blank "unset" that hides the current choice.
             return value === undefined || value === null ? getLang() : String(value)
+          },
+        },
+        {
+          path: ['fullscreen'],
+          label: 'Fullscreen mode',
+          descriptions: { zh: '全屏模式' },
+          // 故意不用 "alt-screen" 这类终端术语：读者要的是行为差异。鼠标
+          // 两种模式都可用（整屏页面自带鼠标跟踪），别让描述暗示关掉就
+          // 没有鼠标——最常见的误解。长度对齐既有最长 hint（单行假设）。
+          hint: 'On: app takes the whole screen (vim/less style), in-app mouse. Off: native scrollback; full-page screens keep the mouse. Restart to apply.',
+          hintDescriptions: { zh: '开启：接管整个终端（同 vim/less），应用内鼠标；关闭：终端原生滚动选择；整屏页两种模式都有鼠标。重启生效。' },
+          kind: 'boolean',
+          format(value: unknown): string {
+            // Unset in settings.yaml: show what THIS session booted with
+            // (the cordis.yml resolution) instead of a misleading false.
+            return value === undefined || value === null ? String(bootedFullscreen) : String(value)
           },
         },
         {
@@ -513,6 +597,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             { value: 'none', label: 'None', descriptions: { zh: '无' } },
             { value: 'subtle', label: 'Subtle', descriptions: { zh: '轻微' } },
             { value: 'strong', label: 'Strong', descriptions: { zh: '明显' } },
+          ],
+        },
+        {
+          path: ['scrollGutter'],
+          label: 'Transcript gutter',
+          descriptions: { zh: '转录边栏' },
+          hint: 'Right gutter of the fullscreen transcript: per-turn timeline ticks, a proportional scrollbar, or nothing.',
+          hintDescriptions: { zh: '全屏转录区右侧边栏：按轮次的时间线节点、比例滚动条，或留空。' },
+          kind: 'select',
+          options: [
+            { value: 'timeline', label: 'Turn timeline', descriptions: { zh: '轮次时间线' } },
+            { value: 'scrollbar', label: 'Scrollbar', descriptions: { zh: '滚动条' } },
+            { value: 'hidden', label: 'Hidden', descriptions: { zh: '隐藏' } },
           ],
         },
         {
@@ -606,6 +703,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           kind: 'boolean',
         },
         {
+          path: ['statusBar', 'sessionId'],
+          label: 'Show session id',
+          descriptions: { zh: '显示会话 ID' },
+          hint: 'Show the short session id (# + first 8 chars) — it matches the session log filename for --resume.',
+          hintDescriptions: { zh: '显示短会话 ID（# + 前 8 位）——与日志文件名对应，方便 --resume 定位。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
+          path: ['statusBar', 'goal'],
+          label: 'Show goal status',
+          descriptions: { zh: '显示 Goal 状态' },
+          hint: 'Show a compact goal chip (phase glyph + rounds) in the status footer while a goal exists.',
+          hintDescriptions: { zh: '存在 Goal 时，在底部状态栏显示紧凑的 Goal 状态（阶段符号与轮次）。' },
+          group: 'status-bar',
+          kind: 'boolean',
+        },
+        {
           path: ['statusBar', 'mode'],
           label: 'Show session mode',
           descriptions: { zh: '显示会话模式' },
@@ -656,6 +771,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           descriptions: { zh: '鲸鱼娘' },
           hint: 'Show the pixel whale in the header splash.',
           hintDescriptions: { zh: '开屏头部显示像素鲸鱼娘。' },
+          kind: 'boolean',
+        },
+        {
+          path: ['minimal'],
+          label: 'Minimal mode',
+          descriptions: { zh: '极简模式' },
+          hint: 'Hide the header splash, emoji glyphs, and decorative colors; code highlight and tool colors stay. Trims the status bar to model + cwd.',
+          hintDescriptions: { zh: '隐藏开屏头部、emoji 状态符与装饰性配色；代码高亮与工具配色保留，底栏只留模型与目录。' },
           kind: 'boolean',
         },
       ],
@@ -731,7 +854,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         void finishExit(
           ctx,
           instance,
-          config.fullscreen === true,
+          bootedFullscreen,
           undefined,
           `dsh-tui crashed: ${message}`,
           () => disposeRootAndExit(ctx, 1),
@@ -747,7 +870,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         void finishExit(
           ctx,
           instance,
-          config.fullscreen === true,
+          bootedFullscreen,
           'Updating @deepseek-harness-tui/dsh-tui and restarting…',
           undefined,
           () => runUpdate(ctx, profile, channel.agentId, updateTargetVersion),
@@ -776,7 +899,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       void finishExit(
         ctx,
         instance,
-        config.fullscreen === true,
+        bootedFullscreen,
         hint,
         undefined,
         () => disposeRootAndExit(ctx, 0),
@@ -785,6 +908,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   const handleExit = funnel.handleExit
 
+  // Chat's `fullscreen` prop must match the root wrap below, or the
+  // full-screen surfaces inside Chat (session browser, settings, trajectory,
+  // subagent pages) would nest a SECOND <AlternateScreen> — whose unmount
+  // writes DEC 1049 exit and drops the whole app back to the main screen
+  // (the stable /resume→Esc "exited fullscreen" repro). The prop is captured
+  // when the element is created, so wait for the settings first-application
+  // BEFORE creating Chat: the element must see the same bootedFullscreen the
+  // root tree resolves after settingsReady below.
+  await settingsReady
   const chat = React.createElement(Chat, {
     channel,
     questionStore,
@@ -798,7 +930,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Full-screen surfaces inside Chat — the trajectory scene and the session
     // browser — enter the alt screen themselves in inline mode; in fullscreen
     // the tree is already wrapped below, so they must not nest.
-    fullscreen: config.fullscreen === true,
+    fullscreen: bootedFullscreen,
     onExit: () => handleExit(),
     // Only a `dsh --profile <name>` launch has a profile installation for
     // `/update` to act on; source checkouts and `--config` overlays get the
@@ -840,6 +972,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       })
     },
   })
+  // Freeze the fullscreen decision only NOW, right before the tree mounts:
+  // Chat above was created after the same settingsReady await, so the root
+  // wrap and the `fullscreen` prop share one value; a mid-session /settings
+  // edit from here on is persisted for the next boot (the watch notifies),
+  // never applied live (swapping layouts requires re-mounting the tree).
+  // Host recompose hardening: never regress a fullscreen session to inline
+  // on a re-mount whose settings application arrived late (see the module
+  // latch note). A fresh process still resolves from config + settings
+  // normally — the latch is undefined there.
+  if (bootedFullscreen === false && lastBootedFullscreen === true) {
+    bootedFullscreen = true
+  }
+  fullscreenFrozen = true
   // fullscreen: wrap the tree in <AlternateScreen> (DEC 1049 + SGR mouse
   // tracking), which turns on in-app text selection (copy-on-select via
   // useCopyOnSelect), wheel scroll, and click/hover hit-testing. Inline
@@ -847,9 +992,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const tree = React.createElement(
     ThemeProvider,
     null,
-    config.fullscreen ? React.createElement(AlternateScreen, null, chat) : chat,
+    bootedFullscreen ? React.createElement(AlternateScreen, null, chat) : chat,
   )
   instance = await render(tree, { exitOnCtrlC: false })
+  const isRecompose = lastBootedFullscreen !== undefined
+  lastBootedFullscreen = bootedFullscreen
+  logMouseDebug('apply mount', { bootedFullscreen, isRecompose })
 
   // Check in the background so registry latency never delays the first frame.
   // A failed/offline check is intentionally silent; the manual `/update`
@@ -871,6 +1019,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // skill commands (issue #86) would survive this exact recompose and the
   // re-mounted channel would find the names taken, freezing its menu.
   ctx.effect(() => () => {
+    logMouseDebug('apply teardown')
     funnel.markTeardown()
     channel.releaseContributions()
     instance?.unmount()
@@ -913,9 +1062,13 @@ async function resolveAgent(
 ): Promise<{ agent: Agent; handle?: AgentHandle; agentPreset?: string; route?: ModelRoute }> {
   // Resume override (issue #67): cordis.yml overrides the target session's
   // recorded route only when it pins BOTH halves; undefined halves let the
-  // session's own request/header records win (issue #30).
+  // session's own request/header records win (issue #30). The recorded route
+  // is ALSO fed back into agentOptions (not just the status line): a resume
+  // whose cordis.yml pins only `provider` would otherwise leave
+  // agentOptions.model undefined, which breaks the `{{model}}` persona
+  // variable for the resumed agent's own assembly and for every subagent it
+  // spawns (dsh-subagent inherits `parent.options.model`).
   const resumeRoute = explicitModelRoute(configuredRoute)
-  const resumeOptions = { provider: resumeRoute?.provider, model: resumeRoute?.model }
   if (requestedSessionId !== undefined) {
     const resumeId = SessionId(requestedSessionId)
     const existing = ctx.agents.get(resumeId)
@@ -932,6 +1085,11 @@ async function resolveAgent(
       // caller's current preference.
       const persisted = await resolvePersistedPreset(ctx, resumeId)
       const composed = await composePreset(ctx, persisted)
+      const recorded = await resolvePersistedRoute(ctx, resumeId)
+      const resumeOptions = {
+        provider: resumeRoute?.provider ?? recorded?.provider,
+        model: resumeRoute?.model ?? recorded?.model,
+      }
       const resumed = await ctx.agents.resume({
         resumeSessionId: resumeId,
         agentOptions: resumeOptions,

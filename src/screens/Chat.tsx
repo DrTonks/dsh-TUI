@@ -1,5 +1,5 @@
 import React from 'react'
-import { t, getLang, setLang, isLang, writeLangPref, subscribeLang, type I18nKey } from '../i18n.js'
+import { t, getLang, setLang, isLang, writeLangPref, subscribeLang, LANGS, type I18nKey, type Lang } from '../i18n.js'
 import { AlternateScreen, Box, Text, useInput, ScrollBox, type ScrollBoxHandle, useTheme, useTerminalSize } from '../ui.js'
 import * as tuiKit from '../ui.js'
 import { POINTER } from '../cc/figures.js'
@@ -26,6 +26,10 @@ import { useCopyOnSelect } from '../ink/hooks/use-copy-on-select.js'
 import { useSelection } from '../ink/hooks/use-selection.js'
 import { NoSelect } from '../ink/components/NoSelect.js'
 import { LogoHeader, MessageList } from '../components/MessageList.js'
+import { TimelineRail } from '../components/TimelineRail.js'
+import { ScrollbarGutter } from '../components/ScrollbarGutter.js'
+import type { TimelineSnapshot } from '../ink/timeline-rail.js'
+import { normalizeScrollGutter } from '../tuiDisplayPrefs.js'
 import { OverlayAbove } from '../components/OverlayAbove.js'
 import { PromptInput, type PromptController } from '../components/PromptInput.js'
 import { GoalTodoPanel } from '../components/GoalTodoPanel.js'
@@ -39,11 +43,15 @@ import { SkillsPicker, SkillsPickerLoading } from '../components/SkillsPicker.js
 import { SessionBrowser } from './SessionBrowser.js'
 import { Settings } from './Settings.js'
 import { WorkspacePicker } from '../components/WorkspacePicker.js'
+import { WorkspaceMenuPicker } from '../components/WorkspaceMenuPicker.js'
 import { WorkspaceFlowPicker } from '../components/WorkspaceFlowPicker.js'
 import type { TuiWorkspaceCommandResult, TuiWorkspaceTarget } from '../workspaces.js'
 import { ActivityPicker } from '../components/ActivityPicker.js'
 import { EffortSlider } from '../components/EffortSlider.js'
 import { PresetPicker } from '../components/PresetPicker.js'
+import { PermissionsPicker, PERMISSION_PRESET_IDS } from '../components/PermissionsPicker.js'
+import { PlanPicker } from '../components/PlanPicker.js'
+import { LangPicker } from '../components/LangPicker.js'
 import { ThemePicker, getThemeOptions } from '../components/ThemePicker.js'
 import { AUTO_THEME_NAME, getAutoThemeBase } from '../theme.js'
 import { FRAME_PRESETS, PRESET_NAMES } from '../components/activityFrames.js'
@@ -52,6 +60,8 @@ import { HistorySearchDialog } from '../components/HistorySearchDialog.js'
 import { RewindPicker } from '../components/RewindPicker.js'
 import { BtwPanel } from '../components/BtwPanel.js'
 import { TipsPanel } from '../components/TipsPanel.js'
+import { SubagentDashboard } from '../components/SubagentDashboard.js'
+import { SubagentDetailScene } from '../components/SubagentDetailScene.js'
 import { setClipboard } from '../ink/termio/osc.js'
 import { TerminalWriteContext } from '../ink/useTerminalNotification.js'
 import instances from '../ink/instances.js'
@@ -65,6 +75,13 @@ import { LoadingState } from '../components/design-system/LoadingState.js'
 import { Pane } from '../components/design-system/Pane.js'
 import { loadHistory, type HistoryEntry } from '../history.js'
 import { formatLoadedContextReport } from '../utils/loaded-context.js'
+import {
+  NO_OVERLAY,
+  chatOverlayReducer,
+  dialogOverlayVisible,
+  wrapIndex,
+  type WorkspaceFlowInput,
+} from './chatOverlay.js'
 
 /** Shared empty snapshot for hosts whose channel has no event log. */
 const NO_EVENTS: readonly SessionEvent[] = []
@@ -125,8 +142,11 @@ function searchableText(row: ChatRow): string {
 
 /**
  * Main chat screen in the Claude Code layout: a scrollable transcript
- * (with the current turn's prompt pinned above the viewport while scrolled
- * up), transient notifications, the working spinner, the bordered prompt
+ * (with the user message the viewport is showing pinned above the transcript
+ * while scrolled up, and a 1-column minimap scrollbar with one node per
+ * user message — the current message's node is highlighted, clicking a node
+ * jumps to it), transient notifications, the working spinner, the bordered
+ * prompt
  * input (with slash-command overlay) and the status line pinned at the
  * bottom.
  *
@@ -264,18 +284,46 @@ export function Chat({
   const [expanded, setExpanded] = React.useState(false)
   const [helpOpen, setHelpOpen] = React.useState(false)
   const [handle, setHandle] = React.useState<ScrollBoxHandle | null>(null)
+  /**
+   * Conversation timeline snapshot (reported by MessageList): one entry
+   * per user turn plus the viewport-derived navigation targets. The
+   * ACTIVE turn — the one whose content owns the viewport top row — pins
+   * the sticky prompt header AND highlights the transcript rail's tick,
+   * from one report so the two can never disagree; upId/downId drive the
+   * rail's ▲/▼. Null activeId while pinned to the bottom only when there
+   * are no turns (header hidden there anyway).
+   */
+  const [timeline, setTimeline] = React.useState<TimelineSnapshot>({
+    turns: [],
+    activeId: null,
+    upId: null,
+    downId: null,
+  })
   const [selectionActive, setSelectionActive] = React.useState(false)
   const [selectedId, setSelectedId] = React.useState<number | null>(null)
   const [expandedRows, setExpandedRows] = React.useState<ReadonlySet<number>>(
     () => new Set(),
   )
-  const [modelPickerOpen, setModelPickerOpen] = React.useState(false)
+  /** 流式 reasoning 行的用户折叠（点击/进入折叠态）。与 expandedRows 分开：
+   *  流式默认展开，用户点一下 = 折叠（preview ticker 或单行头）；落定后
+   *  默认折叠，此集合不再参与——两种默认互不翻转。 */
+  const [streamFoldedRows, setStreamFoldedRows] = React.useState<ReadonlySet<number>>(
+    () => new Set(),
+  )
+  /**
+   * The transient-dialog layer (every picker/dialog `<OverlayAbove>` hosts,
+   * plus /tips) as ONE value: mutual exclusion between the panels is
+   * structural instead of emerging from "an open picker makes the prompt
+   * inert". Transitions live in the pure reducer (chatOverlay.ts), which
+   * scripts/verify-chat-overlay.ts pins without a renderer. Async data the
+   * pickers show (model list, preset roster, …) stays in the caches below —
+   * it persists across open/close so a reopened picker paints the previous
+   * list while the fresh one loads, exactly as the boolean era did.
+   */
+  const [overlay, dispatchOverlay] = React.useReducer(chatOverlayReducer, NO_OVERLAY)
   const [models, setModels] = React.useState<readonly LlmModelInfo[]>([])
-  const [modelIndex, setModelIndex] = React.useState(0)
   /** `/skills` 技能目录（issue #204）：null = 注册表快照在途。 */
-  const [skillsPickerOpen, setSkillsPickerOpen] = React.useState(false)
   const [skillsList, setSkillsList] = React.useState<readonly SkillInfo[] | null>(null)
-  const [skillsIndex, setSkillsIndex] = React.useState(0)
   /** `/resume` opens the session browser, a screen rather than a panel. It
    *  owns its own selection, filters and keyboard — Chat only opens it. */
   const [browserOpen, setBrowserOpen] = React.useState(false)
@@ -283,58 +331,22 @@ export function Chat({
    *  browser, a screen rather than a panel: it owns its own focus, staged
    *  drafts and keyboard; Chat only opens it. */
   const [settingsOpen, setSettingsOpen] = React.useState(false)
-  const [workspacePickerOpen, setWorkspacePickerOpen] = React.useState(false)
   const [workspaceTargets, setWorkspaceTargets] = React.useState<readonly TuiWorkspaceTarget[]>([])
-  const [workspaceIndex, setWorkspaceIndex] = React.useState(0)
-  const [workspaceFlow, setWorkspaceFlow] = React.useState<Extract<TuiWorkspaceCommandResult, { kind: 'choices' }> | null>(null)
-  const [workspaceFlowIndex, setWorkspaceFlowIndex] = React.useState(0)
-  const [workspaceFlowBusy, setWorkspaceFlowBusy] = React.useState(false)
-  const [workspaceFlowInput, setWorkspaceFlowInput] = React.useState<{
-    choiceId: string
-    value: string
-    cursor: number
-    placeholder?: string
-  } | null>(null)
   const workspaceFlowRequestRef = React.useRef(0)
   const workspaceFlowAbortRef = React.useRef<AbortController | null>(null)
-  /** `/activity` indicator picker (pi extension's interactive select). */
-  const [activityPickerOpen, setActivityPickerOpen] = React.useState(false)
-  const [activityIndex, setActivityIndex] = React.useState(0)
-  /** `/preset` agent-preset picker (issue #8): roster list loads async. */
-  const [presetPickerOpen, setPresetPickerOpen] = React.useState(false)
+  /** `/preset` agent-preset roster (issue #8): loads async, persists. */
   const [presetOptions, setPresetOptions] = React.useState<readonly PresetOption[]>([])
-  const [presetIndex, setPresetIndex] = React.useState(0)
-  /** `/effort` rheostat slider: adapter levels load async, focus moves ←/→. */
-  const [effortSliderOpen, setEffortSliderOpen] = React.useState(false)
+  /** `/effort` adapter levels: load async before the slider opens. */
   const [effortOptions, setEffortOptions] = React.useState<readonly EffortOption[]>([])
-  const [effortIndex, setEffortIndex] = React.useState(0)
-  /** `/theme` color-theme picker (built-ins + ~/.dsh-tui/themes user themes). */
-  const [themePickerOpen, setThemePickerOpen] = React.useState(false)
-  const [themeIndex, setThemeIndex] = React.useState(0)
   const [themeName, setTheme] = useTheme()
   const { rows: terminalRows } = useTerminalSize()
   const [showAllMessages, setShowAllMessages] = React.useState(false)
+  /** Fold state for the GoalTodoPanel todo section (ctrl/cmd+q or click). */
+  const [todoCollapsed, setTodoCollapsed] = React.useState(false)
   const [thinkingVisible, setThinkingVisible] = React.useState(true)
-  const [thinkingOpen, setThinkingOpen] = React.useState(false)
-  const [thinkingFocus, setThinkingFocus] = React.useState(0)
-  /** ctrl+r history search dialog (ported from CC's HistorySearchDialog). */
-  const [historyOpen, setHistoryOpen] = React.useState(false)
-  const [historyQuery, setHistoryQuery] = React.useState('')
-  const [historyCursor, setHistoryCursor] = React.useState(0)
-  const [historyFocus, setHistoryFocus] = React.useState(0)
+  /** ctrl+r history-search entries (loaded on open, persists). */
   const [historyEntries, setHistoryEntries] = React.useState<readonly HistoryEntry[]>([])
   const [historyFill, setHistoryFill] = React.useState<string | null>(null)
-  /** Double-Esc rewind picker (CC rewind): open state + focused row + confirm. */
-  const [rewindOpen, setRewindOpen] = React.useState(false)
-  const [rewindIndex, setRewindIndex] = React.useState(0)
-  const [rewindConfirm, setRewindConfirm] = React.useState<ChatRow | null>(null)
-  /** Plugin rewind modes (tui/rewind-prompt seam): extra choices offered in
-   *  the confirm pane; null = the plain conversation-only confirm. */
-  const [rewindModes, setRewindModes] = React.useState<readonly TuiRewindMode[] | null>(null)
-  const [rewindModeIndex, setRewindModeIndex] = React.useState(0)
-  /** True while the tui/rewind-prompt decision is in flight (a plugin may be
-   *  showing its own dialog); keys except Esc are swallowed meanwhile. */
-  const [rewindBusy, setRewindBusy] = React.useState(false)
   /** Monotonic token: only the latest rewind decision may land (a slow
    *  plugin answering after the user moved on must not open a confirm for
    *  a row they are no longer looking at). */
@@ -348,8 +360,10 @@ export function Chat({
     btwAbortRef.current = null
     setBtw(null)
   }
-  /** /tips usage-tips overlay: pure UI state, no session side effects. */
-  const [tipsOpen, setTipsOpen] = React.useState(false)
+  /** Subagent dashboard (Ctrl+A): displays active/completed subagents. */
+  const [subagentDashboardOpen, setSubagentDashboardOpen] = React.useState(false)
+  /** Detail view for a specific subagent (opened from dashboard). */
+  const [subagentDetailId, setSubagentDetailId] = React.useState<string | null>(null)
   /**
    * Hidden `/deepseek` easter egg: each invocation bumps this key so the
    * logo header remounts and replays the whale spout + text shimmer.
@@ -400,8 +414,10 @@ export function Chat({
     ink?.invalidatePrevFrame()
     ink?.reanchorViewport()
   }, [])
-  /** `/` transcript search (less-style incsearch, ported from CC's REPL). */
-  const [searchOpen, setSearchOpen] = React.useState(false)
+  /** `/` transcript search (less-style incsearch, ported from CC's REPL).
+   *  Only the bar's open/closed mode lives in `overlay`; the query and match
+   *  counters persist past the bar closing so n/N keep walking the matches. */
+  const searchActive = overlay.kind === 'search'
   const [searchQuery, setSearchQuery] = React.useState('')
   const [searchCursor, setSearchCursor] = React.useState(0)
   const [searchCount, setSearchCount] = React.useState(0)
@@ -436,7 +452,10 @@ export function Chat({
         : -1
     }
   }, [isSticky, channel.rows])
-  const showPill = !isSticky && unseenCount > 0
+  // The pill shows whenever the view is off the bottom (one-click return
+  // home): with unseen rows it counts them, otherwise it is the plain
+  // "return to bottom" affordance (Enter/End/click all land it).
+  const showPill = !isSticky
 
   // Idle Ctrl+C: first press arms an exit, second press exits (CC's
   // double-press semantics, simplified). Under Windows ConPTY the key
@@ -512,20 +531,24 @@ export function Chat({
 
   const handleWorkspaceResult = (result: TuiWorkspaceCommandResult): void => {
     workspaceFlowAbortRef.current = null
-    setWorkspaceFlowBusy(false)
-    setWorkspaceFlowInput(null)
     if (result.kind === 'target') {
-      setWorkspaceFlow(null)
+      dispatchOverlay({ type: 'close-if', kind: 'workspace-flow' })
       void channel.switchWorkspace(result.target)
       return
     }
     if (result.choices.length === 0) {
-      setWorkspaceFlow(null)
+      dispatchOverlay({ type: 'close-if', kind: 'workspace-flow' })
       channel.notify(t('workspace-command-empty'))
       return
     }
-    setWorkspaceFlow(result)
-    setWorkspaceFlowIndex(0)
+    // open-if: 'workspace-flow' stays allowed so an in-flow action can
+    // transition to its next stage; a picker the user opened after leaving
+    // the menu wins over a late command result.
+    dispatchOverlay({
+      type: 'open-if',
+      overlay: { kind: 'workspace-flow', flow: result, index: 0, busy: false, input: null },
+      when: ['none', 'workspace-flow'],
+    })
   }
 
   const runWorkspaceFlowAction = (
@@ -534,7 +557,7 @@ export function Chat({
     const request = ++workspaceFlowRequestRef.current
     const controller = new AbortController()
     workspaceFlowAbortRef.current = controller
-    setWorkspaceFlowBusy(true)
+    dispatchOverlay({ type: 'flow-busy', busy: true })
     void Promise.resolve()
       .then(() => action(controller.signal))
       .then((result) => {
@@ -543,13 +566,29 @@ export function Chat({
       .catch((error: unknown) => {
         if (request !== workspaceFlowRequestRef.current) return
         workspaceFlowAbortRef.current = null
-        setWorkspaceFlowBusy(false)
+        dispatchOverlay({ type: 'flow-busy', busy: false })
         channel.notify(
           t('workspace-command-failed', { err: error instanceof Error ? error.message : String(error) }),
           { color: 'error', timeoutMs: 8000 },
         )
       })
   }
+
+  /** Bare `/workspace` menu rows: built-in subcommands first, then the
+   *  dynamically registered extensions (same reserved-name filter the Tab
+   *  completion applies). Recomputed per render — the extension list is
+   *  live. */
+  const workspaceMenuOptions: ReadonlyArray<{ id: string; label: string; description: string }> = [
+    { id: 'resume', label: 'resume', description: t('workspace-menu-resume-desc') },
+    { id: 'rename', label: 'rename', description: t('workspace-menu-rename-desc') },
+    { id: 'open', label: 'open', description: t('workspace-menu-open-desc') },
+    // Optional call: verify/repro scripts and embedders stub the channel
+    // without the workspace-commands API — render must not throw for them
+    // (a thrown render unmounts the whole Ink root).
+    ...(channel.workspaceCommands?.() ?? [])
+      .filter(command => !['resume', 'rename', 'open'].includes(command.name.toLowerCase()))
+      .map(command => ({ id: command.name, label: command.name, description: command.description })),
+  ]
 
   const openWorkspaceTarget = (reference: string): void => {
     void channel.resolveWorkspace(reference).then((target) => {
@@ -573,8 +612,15 @@ export function Chat({
         return
       }
       setWorkspaceTargets(targets)
-      setWorkspaceIndex(Math.max(0, targets.findIndex(target => target.cwd === channel.cwd)))
-      setWorkspacePickerOpen(true)
+      // open-if: the listing is async — whatever the user opened meanwhile wins.
+      dispatchOverlay({
+        type: 'open-if',
+        overlay: {
+          kind: 'workspace-picker',
+          index: Math.max(0, targets.findIndex(target => target.cwd === channel.cwd)),
+        },
+        when: ['none'],
+      })
     }).catch((error: unknown) => {
       channel.notify(
         t('workspace-list-failed', { err: error instanceof Error ? error.message : String(error) }),
@@ -584,12 +630,67 @@ export function Chat({
   }
 
   /**
+   * Run one /workspace menu row (Enter path, shared with the mouse click):
+   * built-ins dispatch locally, extension commands go through the channel.
+   */
+  const runWorkspaceMenuOption = (option: { id: string } | undefined): void => {
+    dispatchOverlay({ type: 'close-if', kind: 'workspace-menu' })
+    if (option === undefined) return
+    if (option.id === 'resume') {
+      openWorkspaceResume()
+    } else if (option.id === 'rename') {
+      channel.notify(t('workspace-rename-usage'))
+    } else if (option.id === 'open') {
+      channel.notify(t('workspace-open-usage'))
+    } else {
+      void channel.runWorkspaceCommand(option.id, '').then((result) => {
+        if (result !== undefined) handleWorkspaceResult(result)
+      }).catch((error: unknown) => {
+        channel.notify(
+          t('workspace-command-failed', { err: error instanceof Error ? error.message : String(error) }),
+          { color: 'error', timeoutMs: 8000 },
+        )
+      })
+    }
+  }
+
+  /**
    * Dispatch a slash command; false lets the input flow to the model.
    * Built-in names run the local switch; anything registered by a DSH
    * plugin (plan/goal/…) dispatches through the command registry, whose
    * result text lands as a notification. `rawInput` carries the text after
    * the command name (`/plan off` → ` off`).
    */
+  /** Localized display name of a sandbox mode id (`read-only` /
+   *  `workspace-write` / `danger-full-access`), for `/permission status`. */
+  const permissionPresetName = (id: string | undefined): string => {
+    switch (id) {
+      case 'read-only': return t('permission-preset-readonly')
+      case 'workspace-write': return t('permission-preset-workspace-write')
+      case 'danger-full-access': return t('permission-preset-full-access')
+      default: return id ?? '—'
+    }
+  }
+
+  /** Hot-swap the UI language (`/lang <id>` and the LangPicker both land
+   *  here): persist to ~/.dsh-tui/lang.json and mirror into the dsh-tui
+   *  settings namespace when it is served (best effort). */
+  const applyLang = (lang: Lang): void => {
+    const ok = writeLangPref(lang)
+    setLang(lang)
+    const settingsHost = channel.settingsHost()
+    const tuiView = settingsHost?.listNamespaces().find(entry => entry.ns === 'dsh-tui')
+    if (settingsHost !== undefined && tuiView !== undefined) {
+      void settingsHost
+        .write('dsh-tui', [{ op: 'set', path: ['lang'], value: lang }], tuiView.revision)
+        .catch(() => {})
+    }
+    channel.notify(
+      ok ? t('lang-switched', { lang }) : t('lang-switch-failed', { lang }),
+      { color: ok ? 'success' : 'error' },
+    )
+  }
+
   const runCommand = (name: string, rawInput = ''): boolean => {
     switch (name) {
       case 'activity': {
@@ -628,8 +729,13 @@ export function Chat({
           return true
         }
         setHelpOpen(false)
-        setActivityIndex(Math.max(0, PRESET_NAMES.indexOf(channel.activityFrames ?? 'random')))
-        setActivityPickerOpen(true)
+        dispatchOverlay({
+          type: 'open',
+          overlay: {
+            kind: 'activity',
+            index: Math.max(0, PRESET_NAMES.indexOf(channel.activityFrames ?? 'random')),
+          },
+        })
         return true
       }
       case 'preset': {
@@ -656,16 +762,26 @@ export function Chat({
           return true
         }
         setHelpOpen(false)
-        setPresetPickerOpen(true)
+        // The picker opens immediately over the cached roster (no loading
+        // pane — deliberate contrast with /model); the fresh list lands with
+        // the authoritative focus. Both loader writes are kind-guarded, so a
+        // picker the user already left is not resurrected or re-focused.
+        dispatchOverlay({
+          type: 'open',
+          overlay: {
+            kind: 'preset',
+            index: Math.max(0, presetOptions.findIndex(preset => preset.id === channel.agentPreset)),
+          },
+        })
         void channel.listPresets().then((list) => {
           if (list.length === 0) {
-            setPresetPickerOpen(false)
+            dispatchOverlay({ type: 'close-if', kind: 'preset' })
             channel.notify(t('preset-roster-unmounted'), { color: 'warning' })
             return
           }
           setPresetOptions(list)
           const index = list.findIndex(preset => preset.id === channel.agentPreset)
-          setPresetIndex(index >= 0 ? index : 0)
+          dispatchOverlay({ type: 'set-index', kind: 'preset', index: index >= 0 ? index : 0 })
         })
         return true
       }
@@ -695,16 +811,22 @@ export function Chat({
           setEffortOptions(efforts)
           const current = channel.reasoningEffort ?? defaultEffort
           const index = efforts.findIndex(effort => effort.id === current)
-          setEffortIndex(index >= 0 ? index : 0)
-          setEffortSliderOpen(true)
+          // open-if: a picker the user opened during the round trip wins
+          // over this late-arriving slider.
+          dispatchOverlay({
+            type: 'open-if',
+            overlay: { kind: 'effort', index: index >= 0 ? index : 0 },
+            when: ['none'],
+          })
         })
         return true
       }
       case 'lang': {
         // `/lang` shows the current UI language, `/lang en|zh` switches
-        // (hot-swap, persisted to ~/.dsh-tui/lang.json). Precedence on next
-        // launch: DSH_TUI_LANG > settings.yaml `dsh-tui.lang` > cordis.yml
-        // `lang` > the persisted choice.
+        // (hot-swap, persisted to ~/.dsh-tui/lang.json), bare `/lang` opens
+        // the en/zh picker. Precedence on next launch: DSH_TUI_LANG >
+        // settings.yaml `dsh-tui.lang` > cordis.yml `lang` > the persisted
+        // choice.
         const parts = rawInput.trim().split(/\s+/).filter(Boolean)
         if (parts[0] === 'status') {
           setHelpOpen(false)
@@ -718,33 +840,17 @@ export function Chat({
         if (parts.length > 0) {
           setHelpOpen(false)
           if (isLang(parts[0])) {
-            const ok = writeLangPref(parts[0])
-            setLang(parts[0])
-            // Mirror into the dsh-tui settings namespace when it is served,
-            // so /settings and the next boot see the same last-write-wins
-            // choice (best effort; lang.json stays the fallback).
-            const settingsHost = channel.settingsHost()
-            const tuiView = settingsHost?.listNamespaces().find(entry => entry.ns === 'dsh-tui')
-            if (settingsHost !== undefined && tuiView !== undefined) {
-              void settingsHost
-                .write('dsh-tui', [{ op: 'set', path: ['lang'], value: parts[0] }], tuiView.revision)
-                .catch(() => {})
-            }
-            channel.notify(
-              ok ? t('lang-switched', { lang: parts[0] }) : t('lang-switch-failed', { lang: parts[0] }),
-              { color: ok ? 'success' : 'error' },
-            )
+            applyLang(parts[0])
           } else {
             channel.notify(t('lang-unknown', { lang: parts[0] }), { color: 'error' })
           }
           return true
         }
         setHelpOpen(false)
-        channel.pushLocal('/lang', [
-          t('lang-current', { lang: getLang() }),
-          t('lang-switch-hint'),
-          t('lang-persist-hint'),
-        ])
+        dispatchOverlay({
+          type: 'open',
+          overlay: { kind: 'lang', index: getLang() === 'zh' ? 0 : 1 },
+        })
         return true
       }
       case 'theme': {
@@ -780,8 +886,13 @@ export function Chat({
           return true
         }
         setHelpOpen(false)
-        setThemeIndex(Math.max(0, getThemeOptions().findIndex(option => option.value === themeName)))
-        setThemePickerOpen(true)
+        dispatchOverlay({
+          type: 'open',
+          overlay: {
+            kind: 'theme',
+            index: Math.max(0, getThemeOptions().findIndex(option => option.value === themeName)),
+          },
+        })
         return true
       }
       case 'new': {
@@ -842,34 +953,91 @@ export function Chat({
       case 'help':
         setHelpOpen(true)
         return true
-      case 'model':
+      case 'model': {
+        // `/model <provider/model>` switches directly (same live-fork path
+        // as the picker's Enter), bare `/model` opens the picker.
+        const parts = rawInput.trim().split(/\s+/).filter(Boolean)
+        if (parts.length > 0) {
+          setHelpOpen(false)
+          const spec = parts[0]!
+          const slash = spec.indexOf('/')
+          const provider = slash >= 0 ? spec.slice(0, slash) : undefined
+          const id = slash >= 0 ? spec.slice(slash + 1) : spec
+          if (provider === undefined || id.length === 0 || provider.length === 0) {
+            channel.notify(t('model-usage'), { color: 'warning' })
+            return true
+          }
+          void channel.listModels().then((list) => {
+            const model = list.find(m => m.provider === provider && m.id === id)
+            if (model === undefined) {
+              channel.notify(t('model-unknown', { spec }), { color: 'error', timeoutMs: 8000 })
+              return
+            }
+            channel.notify(t('model-switching', { name: model.name }))
+            void channel.switchModel(provider, id).then((ok) => {
+              if (ok) channel.notify(t('model-switched', { name: model.name }))
+            })
+          })
+          return true
+        }
         setHelpOpen(false)
-        setModelPickerOpen(true)
+        // Opens over the cached catalog (empty cache shows the loading
+        // pane); the fresh list lands with the authoritative focus, and the
+        // kind-guarded set-index cannot re-focus a picker the user left.
+        dispatchOverlay({
+          type: 'open',
+          overlay: {
+            kind: 'model',
+            index: Math.max(0, models.findIndex(
+              model => model.provider === channel.provider && model.id === channel.model,
+            )),
+          },
+        })
         void channel.listModels().then((list) => {
           setModels(list)
           const index = list.findIndex(
             model => model.provider === channel.provider && model.id === channel.model,
           )
-          setModelIndex(index >= 0 ? index : 0)
+          dispatchOverlay({ type: 'set-index', kind: 'model', index: index >= 0 ? index : 0 })
         })
         return true
-      case 'skills':
+      }
+      case 'skills': {
         // issue #204: 列出当前 agent 的完整技能目录（名称 + 来源 + 简述），
         // Enter 把可直调技能以 `/name ` 填回输入行（completion-only 分发的
         // 同一路径）。注册表读取走 channel（快照 scoped 到 live agent）。
+        // `/skills <name>` 直达同一个填回动作，跳过选择器。
+        const parts = rawInput.trim().split(/\s+/).filter(Boolean)
+        if (parts.length > 0) {
+          setHelpOpen(false)
+          void channel.listSkills().then((list) => {
+            if (list === undefined) {
+              channel.notify(t('skills-load-failed'), { color: 'error' })
+              return
+            }
+            const skill = list.find(s => s.name === parts[0])
+            if (skill === undefined) {
+              channel.notify(t('skills-unknown', { name: parts[0] }), { color: 'error' })
+              return
+            }
+            if (skill.userInvocable) setHistoryFill(`/${skill.name} `)
+            else channel.notify(t('skills-not-invocable', { name: parts[0] }), { color: 'warning' })
+          })
+          return true
+        }
         setHelpOpen(false)
         setSkillsList(null)
-        setSkillsIndex(0)
-        setSkillsPickerOpen(true)
+        dispatchOverlay({ type: 'open', overlay: { kind: 'skills', index: 0 } })
         void channel.listSkills().then((list) => {
           if (list === undefined) {
-            setSkillsPickerOpen(false)
+            dispatchOverlay({ type: 'close-if', kind: 'skills' })
             channel.notify(t('skills-load-failed'), { color: 'error' })
             return
           }
           setSkillsList(list)
         })
         return true
+      }
       case 'provider': {
         // Interactive add-provider wizard (/provider): drives the shared
         // question panel, persists profile + key via the channel's settings/
@@ -895,8 +1063,10 @@ export function Chat({
       }
       case 'thinking':
         setHelpOpen(false)
-        setThinkingOpen(true)
-        setThinkingFocus(thinkingVisible ? 0 : 1)
+        dispatchOverlay({
+          type: 'open',
+          overlay: { kind: 'thinking', focus: thinkingVisible ? 0 : 1 },
+        })
         return true
       case 'tokens': {
         const usage = t('tokens-usage', { in: formatTokens(channel.tokens.input), out: formatTokens(channel.tokens.output) })
@@ -926,10 +1096,9 @@ export function Chat({
         const subcommand = (separator < 0 ? trimmed : trimmed.slice(0, separator)).toLowerCase()
         const input = separator < 0 ? '' : trimmed.slice(separator).trim()
         if (subcommand === '') {
-          const extensions = channel.workspaceCommands()
-            .map(command => ` | ${command.name}`)
-            .join('')
-          channel.pushLocal('/workspace', [t('workspace-command-usage', { commands: extensions })])
+          // Bare `/workspace` opens the action menu (resume / rename / open
+          // plus any registered extensions) instead of a text usage line.
+          dispatchOverlay({ type: 'open', overlay: { kind: 'workspace-menu', index: 0 } })
         } else if (subcommand === 'resume') {
           openWorkspaceResume()
         } else if (subcommand === 'rename') {
@@ -1100,25 +1269,85 @@ export function Chat({
       case 'logout':
         channel.notify(t('login-logout-hint'))
         return true
-      case 'permissions':
-        setHelpOpen(false)
-        channel.pushLocal('/permissions', [
-          t('permissions-policy-hint'),
-          t('permissions-approval-hint'),
-          // /permission comes from the dsh-base permission-presets row via the
-          // commands registry; only advertise it when this composition
-          // actually mounted it (the bare cordis.yml leaf has no
-          // permission-presets, so the command does not exist there).
-          ...(channel.commandList.some(command => command.name === 'permission')
-            ? [t('permissions-preset-hint')]
-            : []),
-        ])
-        return true
+      case 'permission': {
+        // The command itself is registered by dsh-sandbox-policy (dsh-base
+        // permission-presets row): bare `/permission` opens the preset
+        // picker (read-only / workspace-write / danger-full-access) and
+        // Enter dispatches `/permission <preset>` through the same
+        // external-command path a hand-typed argument takes. `/permission
+        // status` prints the policy explainer (absorbed from the removed
+        // `/permissions` command); other arguments pass through verbatim.
+        // When the row is not mounted the default external path (or the
+        // model, when nothing is registered) wins.
+        const mounted = channel.commandList.some(command => command.external && command.name === 'permission')
+        const parts = rawInput.trim().split(/\s+/).filter(Boolean)
+        if (mounted && parts[0] === 'status') {
+          setHelpOpen(false)
+          channel.pushLocal('/permission', [
+            t('permission-current', { name: permissionPresetName(channel.mode.sandbox) }),
+            t('permission-policy-hint'),
+            t('permission-approval-hint'),
+            t('permission-root-hint', { cwd: channel.cwd }),
+            t('permission-path-hint'),
+          ])
+          return true
+        }
+        if (mounted && parts.length === 0) {
+          setHelpOpen(false)
+          const index = (PERMISSION_PRESET_IDS as readonly string[]).indexOf(channel.mode.sandbox ?? '')
+          dispatchOverlay({
+            type: 'open',
+            overlay: { kind: 'permission', index: index >= 0 ? index : 1 },
+          })
+          return true
+        }
+        if (mounted) {
+          setHelpOpen(false)
+          void channel.runExternalCommand('permission', rawInput).then((text) => {
+            if (text !== undefined && text !== '') {
+              channel.notify(text)
+            } else if (text === undefined) {
+              channel.notify(t('command-not-found', { name: 'permission' }), { color: 'error' })
+            }
+          })
+          return true
+        }
+        return false
+      }
+      case 'plan': {
+        // Registered by dsh-plan-mode: bare `/plan` opens an on/off picker
+        // marked with the current state instead of toggling blindly; Enter
+        // dispatches `/plan` or `/plan off`. Arguments pass through verbatim
+        // (`/plan off`), and an unmounted row falls back to the default
+        // external path.
+        const mounted = channel.commandList.some(command => command.external && command.name === 'plan')
+        const parts = rawInput.trim().split(/\s+/).filter(Boolean)
+        if (mounted && parts.length === 0) {
+          setHelpOpen(false)
+          dispatchOverlay({
+            type: 'open',
+            overlay: { kind: 'plan', index: channel.mode.plan === true ? 0 : 1 },
+          })
+          return true
+        }
+        if (mounted) {
+          setHelpOpen(false)
+          void channel.runExternalCommand('plan', rawInput).then((text) => {
+            if (text !== undefined && text !== '') {
+              channel.notify(text)
+            } else if (text === undefined) {
+              channel.notify(t('command-not-found', { name: 'plan' }), { color: 'error' })
+            }
+          })
+          return true
+        }
+        return false
+      }
       case 'add-dir':
         setHelpOpen(false)
         channel.pushLocal('/add-dir', [
-          t('permissions-root-hint', { cwd: channel.cwd }),
-          t('permissions-path-hint'),
+          t('permission-root-hint', { cwd: channel.cwd }),
+          t('permission-path-hint'),
         ])
         return true
       case 'hooks':
@@ -1189,7 +1418,7 @@ export function Chat({
       }
       case 'tips':
         setHelpOpen(false)
-        setTipsOpen(true)
+        dispatchOverlay({ type: 'open', overlay: { kind: 'tips' } })
         return true
       case 'connect':
         setHelpOpen(false)
@@ -1245,6 +1474,9 @@ export function Chat({
     : NO_ROWS
 
   // ctrl+r history search: substring match on the query, newest first.
+  // The draft lives in the overlay variant; the derived '' while closed
+  // keeps the memo inputs stable (nothing renders the matches then).
+  const historyQuery = overlay.kind === 'history' ? overlay.query : ''
   const historyMatches = React.useMemo(() => {
     const q = historyQuery.trim().toLowerCase()
     return q ? historyEntries.filter(e => e.text.toLowerCase().includes(q)) : historyEntries
@@ -1254,15 +1486,15 @@ export function Chat({
   // selectable user turns; steering side-questions are excluded). Computed
   // per render while the picker is open — `channel.rows` is a live in-place
   // array (see selectableRows).
-  const rewindRows = rewindOpen
+  const rewindRows = overlay.kind === 'rewind'
     ? channel.rows
       .filter(row => row.kind === 'user' && row.label === undefined)
       .reverse()
     : NO_ROWS
   /** Open the rewind picker (from PromptInput's double-Esc on an empty input). */
   const openRewind = () => {
-    // rewindOpen is still false this render, so rewindRows is empty — scan
-    // directly instead of reading the gated list.
+    // The overlay is not 'rewind' yet this render, so rewindRows is empty —
+    // scan directly instead of reading the gated list.
     const candidates = channel.rows
       .filter(row => row.kind === 'user' && row.label === undefined)
       .reverse()
@@ -1270,12 +1502,11 @@ export function Chat({
       channel.notify(t('rewind-none'))
       return
     }
-    setRewindIndex(0)
-    setRewindConfirm(null)
-    setRewindModes(null)
-    setRewindBusy(false)
     rewindRequestRef.current += 1
-    setRewindOpen(true)
+    dispatchOverlay({
+      type: 'open',
+      overlay: { kind: 'rewind', index: 0, confirm: null, modes: null, modeIndex: 0, busy: false },
+    })
   }
   /**
    * Enter on a rewind candidate: ask the plugins first (tui/rewind-prompt).
@@ -1284,14 +1515,14 @@ export function Chat({
    */
   const requestRewindConfirm = async (row: ChatRow) => {
     const token = ++rewindRequestRef.current
-    setRewindBusy(true)
+    dispatchOverlay({ type: 'rewind-busy', busy: true })
     const decision = await channel.promptRewind(row)
     if (token !== rewindRequestRef.current) return
-    setRewindBusy(false)
-    if (decision === 'cancel') return
-    setRewindConfirm(row)
-    setRewindModes(decision?.modes ?? null)
-    setRewindModeIndex(0)
+    if (decision === 'cancel') {
+      dispatchOverlay({ type: 'rewind-busy', busy: false })
+      return
+    }
+    dispatchOverlay({ type: 'rewind-decision', confirm: row, modes: decision?.modes ?? null })
   }
   /** Execute the confirmed rewind; the message comes back into the input. */
   const performRewind = async (row: ChatRow, mode: string | null = null) => {
@@ -1386,12 +1617,29 @@ export function Chat({
     }
     setForceMountRowId(rowId)
   }
+  /**
+   * Reveal-and-seek for a row folded behind the recent-rows window (the
+   * rail's tick for an old turn, the doc's revealAndSeekRow): expand the
+   * fold first, then the ordinary seek takes over — the completion effect
+   * below force-mounts the row and scrollToElement lands it once its ref
+   * (and Yoga top) exist. The fold toggle is idempotent, so calling this
+   * for an already-revealed row is harmless.
+   */
+  const revealAndSeekRow = (rowId: number): void => {
+    if (!showAllMessages) setShowAllMessages(true)
+    seekRow(rowId)
+  }
   React.useLayoutEffect(() => {
     if (forceMountRowId === null) return
     const el = rowRefsRef.current.get(forceMountRowId)
     if (el) {
       handle?.scrollToElement(el)
-      setForceMountRowId(null)
+      // Clear deferred to a macrotask: clearing here would let React's
+      // synchronous re-render narrow the virtualization window and unmount
+      // the row BEFORE the renderer's deferred pass reads its Yoga top
+      // (scrollAnchor processing runs in a microtask) — the seek would
+      // silently no-op (detached anchor element).
+      setTimeout(() => setForceMountRowId(null), 0)
     }
   })
 
@@ -1409,7 +1657,7 @@ export function Chat({
   // Incsearch: highlight all matches (screen-space overlay) and keep the
   // current match row in view as the query changes (CC semantics).
   React.useEffect(() => {
-    if (!searchOpen) return
+    if (!searchActive) return
     setHighlight(searchQuery)
     const count = searchMatches.length
     setSearchCount(count)
@@ -1420,11 +1668,11 @@ export function Chat({
     if (target) {
       seekRow(target.row.id)
     }
-  }, [searchQuery, searchOpen])
+  }, [searchQuery, searchActive])
 
   // n/N navigation: move the current match into view.
   React.useEffect(() => {
-    if (!searchOpen) return
+    if (!searchActive) return
     const target = searchMatches[searchCurrent]
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty/filtered list
     if (target) {
@@ -1456,6 +1704,14 @@ export function Chat({
       return next
     })
   }, [])
+  const toggleStreamFolded = React.useCallback((rowId: number) => {
+    setStreamFoldedRows((previous) => {
+      const next = new Set(previous)
+      if (next.has(rowId)) next.delete(rowId)
+      else next.add(rowId)
+      return next
+    })
+  }, [])
   const registerRowRef = React.useCallback((rowId: number, el: DOMElement | null) => {
     if (el) rowRefsRef.current.set(rowId, el)
     else rowRefsRef.current.delete(rowId)
@@ -1476,6 +1732,8 @@ export function Chat({
     // Same for the settings screen: plain letters (s save / d discard) and
     // the field draft editor belong to it alone.
     if (settingsOpen) return
+    // Subagent dashboard or detail scene: it owns the keyboard while open.
+    if (subagentDashboardOpen || subagentDetailId !== null) return
     // A plugin scene (dsh-tui-scenes) or the trajectory scene owns the whole
     // screen while open: every key belongs to it. Unguarded, an Esc meant to
     // CLOSE the scene also reached the chat:cancel branch below whenever a
@@ -1484,12 +1742,29 @@ export function Chat({
     // Mouse wheel scrolls the transcript even while a question/approval/
     // dialog panel is open — those panels own arrow/Enter/Esc keys, but the
     // transcript above them should still be scrollable in fullscreen mode.
-    // Help is different: its own ScrollBox owns wheel input, so Chat must
-    // yield before stopping propagation or both covered layers would move.
+    //
+    // Wheel routing is position-first: events landing over a ScrollBox
+    // (transcript, help, subagent panels…) are consumed by that box in
+    // App's input batch (onWheelAt) and never reach this branch. What
+    // arrives here is the fallback: wheel over non-scroll areas (prompt,
+    // status bar) or over floating overlays.
+    //   - Help stays yielded: PromptInput's help ScrollBox handles the
+    //     remaining global wheel while help is open (both covered layers
+    //     must not move).
+    //   - Pickers/dialogs are modal: wheel that fell through over them
+    //     must NOT scroll the transcript behind (the audit's
+    //     pass-through gap), so yield like the keyboard guards above.
     // Events only arrive with mouse tracking on; inline mode never sees
     // them, so this is a no-op there.
     if (key.wheelUp || key.wheelDown) {
       if (helpOpen) return
+      // Any open transient dialog is modal to the wheel; the one exception
+      // mirrors the render gate — a workspace picker whose target list has
+      // not landed paints nothing, so wheel-through keeps scrolling.
+      const overlayModal =
+        overlay.kind !== 'none' &&
+        (overlay.kind !== 'workspace-picker' || workspaceTargets.length > 0)
+      if (overlayModal) return
       handle?.scrollBy(key.wheelUp ? -3 : 3)
       event.stopImmediatePropagation()
       return
@@ -1516,17 +1791,17 @@ export function Chat({
       event.stopImmediatePropagation()
       return
     }
-    if (searchOpen) {
+    if (overlay.kind === 'search') {
       // Transcript search bar (less-style): edit the query, Enter commits
       // (query persists for n/N), Esc/ctrl+c cancels back to the anchor.
       if (key.escape || (key.ctrl && input === 'c')) {
-        setSearchOpen(false)
+        dispatchOverlay({ type: 'close' })
         setHighlight('')
         handle?.scrollTo(searchAnchorRef.current)
       } else if (plainReturn) {
         // Enter commits; 0-match junk queries don't persist (CC behavior).
         if (searchCount === 0) setSearchQuery('')
-        setSearchOpen(false)
+        dispatchOverlay({ type: 'close' })
       } else if (key.backspace) {
         if (searchCursor > 0) {
           setSearchQuery(searchQuery.slice(0, searchCursor - 1) + searchQuery.slice(searchCursor))
@@ -1565,203 +1840,250 @@ export function Chat({
       event.stopImmediatePropagation()
       return
     }
-    if (thinkingOpen) {
+    if (overlay.kind === 'thinking') {
       if (key.upArrow || key.downArrow) {
-        setThinkingFocus(index => (index === 0 ? 1 : 0))
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: 2 })
       } else if (plainReturn) {
-        const visible = thinkingFocus === 0
+        const visible = overlay.focus === 0
         setThinkingVisible(visible)
-        setThinkingOpen(false)
+        dispatchOverlay({ type: 'close' })
         channel.notify(t('thinking-toggled', { state: visible ? t('thinking-on') : t('thinking-off') }))
       } else if (key.escape) {
-        setThinkingOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (workspaceFlow !== null) {
+    if (overlay.kind === 'workspace-flow') {
+      const { flow, busy, input: flowInput } = overlay
       if (key.escape) {
-        if (workspaceFlowInput !== null && !workspaceFlowBusy) {
-          setWorkspaceFlowInput(null)
+        if (flowInput !== null && !busy) {
+          dispatchOverlay({ type: 'flow-input', input: null })
           return
         }
         workspaceFlowAbortRef.current?.abort()
         workspaceFlowAbortRef.current = null
         workspaceFlowRequestRef.current += 1
-        setWorkspaceFlowBusy(false)
-        setWorkspaceFlow(null)
+        dispatchOverlay({ type: 'close' })
         return
       }
-      if (workspaceFlowBusy) return
-      if (workspaceFlowInput !== null) {
-        const choice = workspaceFlow.choices.find(candidate => candidate.id === workspaceFlowInput.choiceId)
+      if (busy) return
+      if (flowInput !== null) {
+        const choice = flow.choices.find(candidate => candidate.id === flowInput.choiceId)
         const editor = choice?.input
         if (plainReturn) {
-          const value = workspaceFlowInput.value.trim()
+          const value = flowInput.value.trim()
           if (value.length === 0) {
             channel.notify(t('workspace-flow-input-empty'), { color: 'warning' })
           } else if (editor !== undefined) {
             runWorkspaceFlowAction(signal => editor.submit(value, signal))
           }
-        } else if (key.backspace && workspaceFlowInput.cursor > 0) {
-          setWorkspaceFlowInput(current => current === null ? null : {
-            ...current,
-            value: current.value.slice(0, current.cursor - 1) + current.value.slice(current.cursor),
-            cursor: current.cursor - 1,
+        } else if (key.backspace && flowInput.cursor > 0) {
+          dispatchOverlay({
+            type: 'flow-input-edit',
+            value: flowInput.value.slice(0, flowInput.cursor - 1) + flowInput.value.slice(flowInput.cursor),
+            cursor: flowInput.cursor - 1,
           })
-        } else if (key.delete && workspaceFlowInput.cursor < workspaceFlowInput.value.length) {
-          setWorkspaceFlowInput(current => current === null ? null : {
-            ...current,
-            value: current.value.slice(0, current.cursor) + current.value.slice(current.cursor + 1),
+        } else if (key.delete && flowInput.cursor < flowInput.value.length) {
+          dispatchOverlay({
+            type: 'flow-input-edit',
+            value: flowInput.value.slice(0, flowInput.cursor) + flowInput.value.slice(flowInput.cursor + 1),
+            cursor: flowInput.cursor,
           })
         } else if (key.leftArrow) {
-          setWorkspaceFlowInput(current => current === null ? null : {
-            ...current,
-            cursor: Math.max(0, current.cursor - 1),
+          dispatchOverlay({
+            type: 'flow-input-edit',
+            value: flowInput.value,
+            cursor: Math.max(0, flowInput.cursor - 1),
           })
         } else if (key.rightArrow) {
-          setWorkspaceFlowInput(current => current === null ? null : {
-            ...current,
-            cursor: Math.min(current.value.length, current.cursor + 1),
+          dispatchOverlay({
+            type: 'flow-input-edit',
+            value: flowInput.value,
+            cursor: Math.min(flowInput.value.length, flowInput.cursor + 1),
           })
         } else if (input.length > 0 && !key.ctrl && !key.meta && !key.super && !key.tab) {
-          setWorkspaceFlowInput(current => current === null ? null : {
-            ...current,
-            value: current.value.slice(0, current.cursor) + input + current.value.slice(current.cursor),
-            cursor: current.cursor + input.length,
+          dispatchOverlay({
+            type: 'flow-input-edit',
+            value: flowInput.value.slice(0, flowInput.cursor) + input + flowInput.value.slice(flowInput.cursor),
+            cursor: flowInput.cursor + input.length,
           })
         }
         return
       }
-      if (key.upArrow) {
-        setWorkspaceFlowIndex(index => (index <= 0 ? workspaceFlow.choices.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setWorkspaceFlowIndex(index => (index >= workspaceFlow.choices.length - 1 ? 0 : index + 1))
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: flow.choices.length })
       } else if (key.tab && !key.shift) {
-        const choice = workspaceFlow.choices[workspaceFlowIndex]
+        const choice = flow.choices[overlay.index]
         if (choice?.input !== undefined) {
           const value = choice.input.initialValue ?? ''
-          setWorkspaceFlowInput({
+          const flowInputNext: WorkspaceFlowInput = {
             choiceId: choice.id,
             value,
             cursor: value.length,
             ...(choice.input.placeholder === undefined ? {} : { placeholder: choice.input.placeholder }),
-          })
+          }
+          dispatchOverlay({ type: 'flow-input', input: flowInputNext })
         }
       } else if (plainReturn) {
-        const choice = workspaceFlow.choices[workspaceFlowIndex]
+        const choice = flow.choices[overlay.index]
         if (choice !== undefined) {
           runWorkspaceFlowAction(signal => choice.choose(signal))
         }
       }
       return
     }
-    if (workspacePickerOpen) {
-      if (key.upArrow) {
-        setWorkspaceIndex(index => (index <= 0 ? workspaceTargets.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setWorkspaceIndex(index => (index >= workspaceTargets.length - 1 ? 0 : index + 1))
+    if (overlay.kind === 'workspace-picker') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: workspaceTargets.length })
       } else if (plainReturn) {
-        const target = workspaceTargets[workspaceIndex]
-        setWorkspacePickerOpen(false)
+        const target = workspaceTargets[overlay.index]
+        dispatchOverlay({ type: 'close' })
         if (target !== undefined) void channel.switchWorkspace(target)
       } else if (key.escape) {
-        setWorkspacePickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (modelPickerOpen) {
-      if (key.upArrow) {
-        setModelIndex(index => (index <= 0 ? models.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setModelIndex(index => (index >= models.length - 1 ? 0 : index + 1))
+    if (overlay.kind === 'workspace-menu') {
+      const menu = workspaceMenuOptions
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: menu.length })
       } else if (plainReturn) {
-        const model = models[modelIndex]
+        const option = menu[overlay.index]
+        runWorkspaceMenuOption(option)
+      } else if (key.escape) {
+        dispatchOverlay({ type: 'close' })
+      }
+      return
+    }
+    if (overlay.kind === 'model') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: models.length })
+      } else if (plainReturn) {
+        const model = models[overlay.index]
         // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
         if (model) {
           // Enter switches the live model right away: the conversation is
           // forked at its end and continued with an agent routed to the new
           // model (history replays unchanged).
-          setModelPickerOpen(false)
+          dispatchOverlay({ type: 'close' })
           channel.notify(t('model-switching', { name: model.name }))
           void channel.switchModel(model.provider, model.id).then((ok) => {
             if (ok) channel.notify(t('model-switched', { name: model.name }))
           })
         } else {
-          setModelPickerOpen(false)
+          dispatchOverlay({ type: 'close' })
         }
       } else if (key.escape) {
-        setModelPickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (skillsPickerOpen) {
+    if (overlay.kind === 'skills') {
       const list = skillsList ?? []
-      if (key.upArrow) {
-        if (list.length > 0) setSkillsIndex(index => (index <= 0 ? list.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        if (list.length > 0) setSkillsIndex(index => (index >= list.length - 1 ? 0 : index + 1))
+      if (key.upArrow || key.downArrow) {
+        // count 0 (snapshot still loading) is a no-op inside the reducer.
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: list.length })
       } else if (plainReturn) {
-        const skill = list[skillsIndex]
-        setSkillsPickerOpen(false)
+        const skill = list[overlay.index]
+        dispatchOverlay({ type: 'close' })
         // 可直调技能 Enter 填入 `/name `——与 / 菜单选中技能同一条
         // completion-only 分发路径；模型专用技能（userInvocable=false）只关闭。
         // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
         if (skill?.userInvocable) setHistoryFill(`/${skill.name} `)
       } else if (key.escape) {
-        setSkillsPickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (activityPickerOpen) {
-      if (key.upArrow) {
-        setActivityIndex(index => (index <= 0 ? PRESET_NAMES.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setActivityIndex(index => (index >= PRESET_NAMES.length - 1 ? 0 : index + 1))
+    if (overlay.kind === 'activity') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: PRESET_NAMES.length })
       } else if (plainReturn) {
-        const name = PRESET_NAMES[activityIndex]
-        setActivityPickerOpen(false)
+        const name = PRESET_NAMES[overlay.index]
+        dispatchOverlay({ type: 'close' })
         if (name) channel.setActivityFrames(name)
       } else if (key.escape) {
-        setActivityPickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (effortSliderOpen) {
+    if (overlay.kind === 'effort') {
       if (key.leftArrow || key.rightArrow) {
         const delta = key.leftArrow ? -1 : 1
-        const next = (effortIndex + delta + effortOptions.length) % effortOptions.length
-        setEffortIndex(next)
+        // The same wrap rule the reducer applies — computed here too so the
+        // newly focused level is applied in this very keystroke.
+        const next = wrapIndex(overlay.index, delta, effortOptions.length)
+        dispatchOverlay({ type: 'move', delta, count: effortOptions.length })
         const option = effortOptions[next]
         // Live-apply: the slider IS the control; Esc does not revert.
         if (option) void channel.setEffort(option.id)
       } else if (plainReturn || key.escape) {
-        setEffortSliderOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (presetPickerOpen) {
-      if (key.upArrow) {
-        setPresetIndex(index => (index <= 0 ? presetOptions.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setPresetIndex(index => (index >= presetOptions.length - 1 ? 0 : index + 1))
+    if (overlay.kind === 'preset') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: presetOptions.length })
       } else if (plainReturn) {
-        const option = presetOptions[presetIndex]
-        setPresetPickerOpen(false)
+        const option = presetOptions[overlay.index]
+        dispatchOverlay({ type: 'close' })
         if (option) void channel.switchPreset(option.id)
       } else if (key.escape) {
-        setPresetPickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (themePickerOpen) {
-      const options = getThemeOptions()
-      if (key.upArrow) {
-        setThemeIndex(index => (index <= 0 ? options.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setThemeIndex(index => (index >= options.length - 1 ? 0 : index + 1))
+    if (overlay.kind === 'permission') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: PERMISSION_PRESET_IDS.length })
       } else if (plainReturn) {
-        setThemePickerOpen(false)
-        const name = options[themeIndex]?.value
+        const id = PERMISSION_PRESET_IDS[overlay.index]
+        dispatchOverlay({ type: 'close' })
+        if (id !== undefined) {
+          void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
+            if (text !== undefined && text !== '') channel.notify(text)
+          })
+        }
+      } else if (key.escape) {
+        dispatchOverlay({ type: 'close' })
+      }
+      return
+    }
+    if (overlay.kind === 'plan') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: 2 })
+      } else if (plainReturn) {
+        const on = overlay.index === 0
+        dispatchOverlay({ type: 'close' })
+        void channel.runExternalCommand('plan', on ? '' : ' off').then((text) => {
+          if (text !== undefined && text !== '') channel.notify(text)
+        })
+      } else if (key.escape) {
+        dispatchOverlay({ type: 'close' })
+      }
+      return
+    }
+    if (overlay.kind === 'lang') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: 2 })
+      } else if (plainReturn) {
+        const lang = LANGS[overlay.index]
+        dispatchOverlay({ type: 'close' })
+        if (lang !== undefined) applyLang(lang)
+      } else if (key.escape) {
+        dispatchOverlay({ type: 'close' })
+      }
+      return
+    }
+    if (overlay.kind === 'theme') {
+      const options = getThemeOptions()
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: options.length })
+      } else if (plainReturn) {
+        dispatchOverlay({ type: 'close' })
+        const name = options[overlay.index]?.value
         if (name !== undefined) {
           const ok = setTheme(name)
           channel.notify(
@@ -1770,129 +2092,129 @@ export function Chat({
           )
         }
       } else if (key.escape) {
-        setThemePickerOpen(false)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
-    if (historyOpen) {
+    if (overlay.kind === 'history') {
+      const { query, cursor, focus } = overlay
       if (key.escape) {
-        setHistoryOpen(false)
+        dispatchOverlay({ type: 'close' })
       } else if (key.ctrl && (input === 'c' || input === 'd')) {
         // CC's history search cancels on ctrl+c/ctrl+d too.
-        setHistoryOpen(false)
+        dispatchOverlay({ type: 'close' })
       } else if (plainReturn) {
-        const entry = historyMatches[historyFocus]
+        const entry = historyMatches[focus]
         // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty match list
         if (entry) {
           setHistoryFill(entry.text)
-          setHistoryOpen(false)
+          dispatchOverlay({ type: 'close' })
         }
       } else if (key.upArrow) {
-        setHistoryFocus(index =>
-          historyMatches.length === 0 ? 0 : (index <= 0 ? historyMatches.length - 1 : index - 1),
-        )
+        if (historyMatches.length > 0) {
+          dispatchOverlay({ type: 'move', delta: -1, count: historyMatches.length })
+        }
       } else if (key.downArrow || (isMod(key) && input === 'r')) {
         // CC's historySearch:next — ↓ and repeat ctrl+r walk to the next match.
-        setHistoryFocus(index =>
-          historyMatches.length === 0 ? 0 : (index >= historyMatches.length - 1 ? 0 : index + 1),
-        )
+        if (historyMatches.length > 0) {
+          dispatchOverlay({ type: 'move', delta: 1, count: historyMatches.length })
+        }
       } else if (key.backspace) {
-        if (historyCursor > 0) {
-          const next = historyQuery.slice(0, historyCursor - 1) + historyQuery.slice(historyCursor)
-          setHistoryQuery(next)
-          setHistoryCursor(historyCursor - 1)
-          setHistoryFocus(0)
+        if (cursor > 0) {
+          dispatchOverlay({
+            type: 'history-edit',
+            query: query.slice(0, cursor - 1) + query.slice(cursor),
+            cursor: cursor - 1,
+            focus: 0,
+          })
         }
       } else if (key.delete) {
-        if (historyCursor < historyQuery.length) {
-          setHistoryQuery(historyQuery.slice(0, historyCursor) + historyQuery.slice(historyCursor + 1))
-          setHistoryFocus(0)
+        if (cursor < query.length) {
+          dispatchOverlay({
+            type: 'history-edit',
+            query: query.slice(0, cursor) + query.slice(cursor + 1),
+            focus: 0,
+          })
         }
       } else if (key.leftArrow) {
         // Step by code point, not UTF-16 unit: an emoji is two units, and
         // a mid-pair caret offset would split it in the SearchBox render.
-        setHistoryCursor(cursor => {
-          if (cursor <= 0) return 0
-          const ch = [...historyQuery.slice(0, cursor)].pop()!
-          return cursor - ch.length
-        })
+        if (cursor > 0) {
+          const ch = [...query.slice(0, cursor)].pop()!
+          dispatchOverlay({ type: 'history-edit', cursor: cursor - ch.length })
+        }
       } else if (key.rightArrow) {
-        setHistoryCursor(cursor => {
-          if (cursor >= historyQuery.length) return historyQuery.length
-          const ch = [...historyQuery.slice(cursor)][0]!
-          return cursor + ch.length
-        })
+        if (cursor < query.length) {
+          const ch = [...query.slice(cursor)][0]!
+          dispatchOverlay({ type: 'history-edit', cursor: cursor + ch.length })
+        }
       } else if (key.home) {
-        setHistoryCursor(0)
+        dispatchOverlay({ type: 'history-edit', cursor: 0 })
       } else if (key.end) {
-        setHistoryCursor(historyQuery.length)
+        dispatchOverlay({ type: 'history-edit', cursor: query.length })
       } else if (!key.ctrl && !key.meta && !key.super && input) {
-        const next = historyQuery.slice(0, historyCursor) + input + historyQuery.slice(historyCursor)
-        setHistoryQuery(next)
-        setHistoryCursor(historyCursor + input.length)
-        setHistoryFocus(0)
+        dispatchOverlay({
+          type: 'history-edit',
+          query: query.slice(0, cursor) + input + query.slice(cursor),
+          cursor: cursor + input.length,
+          focus: 0,
+        })
       }
       return
     }
-    if (rewindOpen) {
+    if (overlay.kind === 'rewind') {
       // While the plugin decision is in flight the picker is read-only;
       // Esc abandons the wait (the stale answer is dropped by the token).
-      if (rewindBusy) {
+      if (overlay.busy) {
         if (key.escape) {
           rewindRequestRef.current += 1
-          setRewindBusy(false)
+          dispatchOverlay({ type: 'rewind-busy', busy: false })
         }
         return
       }
-      if (rewindConfirm !== null) {
-        if (rewindModes !== null) {
+      if (overlay.confirm !== null) {
+        const row = overlay.confirm
+        if (overlay.modes !== null) {
           // Plugin offered modes: the confirm pane is a choice list —
           // option 0 is always the built-in conversation-only rewind.
-          const optionCount = rewindModes.length + 1
-          if (key.upArrow) {
-            setRewindModeIndex(index => (index <= 0 ? optionCount - 1 : index - 1))
-          } else if (key.downArrow) {
-            setRewindModeIndex(index => (index >= optionCount - 1 ? 0 : index + 1))
+          const optionCount = overlay.modes.length + 1
+          if (key.upArrow || key.downArrow) {
+            dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: optionCount })
           } else if (plainReturn) {
-            const row = rewindConfirm
-            const mode = rewindModeIndex === 0 ? null : (rewindModes[rewindModeIndex - 1]?.id ?? null)
-            setRewindOpen(false)
-            setRewindConfirm(null)
-            setRewindModes(null)
+            const mode = overlay.modeIndex === 0 ? null : (overlay.modes[overlay.modeIndex - 1]?.id ?? null)
+            dispatchOverlay({ type: 'close' })
             void performRewind(row, mode)
           } else if (key.escape) {
-            setRewindConfirm(null)
-            setRewindModes(null)
+            dispatchOverlay({ type: 'rewind-back' })
           }
           return
         }
         // Confirmation state: Enter rewinds, Esc backs out to the list.
         if (plainReturn) {
-          const row = rewindConfirm
-          setRewindOpen(false)
-          setRewindConfirm(null)
+          dispatchOverlay({ type: 'close' })
           void performRewind(row)
         } else if (key.escape) {
-          setRewindConfirm(null)
+          dispatchOverlay({ type: 'rewind-back' })
         }
-      } else if (key.upArrow) {
-        setRewindIndex(index => (index <= 0 ? rewindRows.length - 1 : index - 1))
-      } else if (key.downArrow) {
-        setRewindIndex(index => (index >= rewindRows.length - 1 ? 0 : index + 1))
+      } else if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: rewindRows.length })
       } else if (plainReturn) {
-        const row = rewindRows[rewindIndex]
+        const row = rewindRows[overlay.index]
         // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
         if (row) void requestRewindConfirm(row)
       } else if (key.escape) {
-        setRewindOpen(false)
-        setRewindConfirm(null)
-        setRewindModes(null)
+        dispatchOverlay({ type: 'close' })
       }
       return
     }
     if (isMod(key) && input === 't') {
       // Ctrl+T opens the trajectory scene at any point in the session.
       openScene()
+      return
+    }
+    if (isMod(key) && input === 'a') {
+      // Ctrl+A opens the subagent dashboard.
+      setSubagentDashboardOpen(true)
       return
     }
     if (isMod(key) && input === 'p' && loadedContextVisible) {
@@ -1903,11 +2225,11 @@ export function Chat({
       return
     }
     if (isMod(key) && input === 'r' && !helpOpen) {
-      setHistoryQuery('')
-      setHistoryCursor(0)
-      setHistoryFocus(0)
       setHistoryEntries(loadHistory())
-      setHistoryOpen(true)
+      dispatchOverlay({
+        type: 'open',
+        overlay: { kind: 'history', query: '', cursor: 0, focus: 0 },
+      })
       return
     }
     if (key.shift && key.upArrow && !selectionActive && !helpOpen) {
@@ -1962,7 +2284,7 @@ export function Chat({
         setSearchCursor(0)
         setSearchCurrent(0)
         setSearchCount(0)
-        setSearchOpen(true)
+        dispatchOverlay({ type: 'open', overlay: { kind: 'search' } })
         event.stopImmediatePropagation()
       }
     } else if (key.ctrl && (input === 'c' || input === 'd')) {
@@ -1985,8 +2307,23 @@ export function Chat({
       instances.get(process.stdout)?.forceRedraw()
     } else if (isMod(key) && input === 'e') {
       setShowAllMessages(previous => !previous)
-    } else if (plainReturn && showPill) {
+    } else if (isMod(key) && input === 'q') {
+      // Fold/unfold the GoalTodoPanel todo section — works mid-turn too:
+      // the collapsed line keeps the done/total count and the live task
+      // preview, so long todo lists stop crowding the prompt.
+      setTodoCollapsed(previous => !previous)
+    } else if (plainReturn && !isSticky) {
+      // Enter while scrolled up returns to the bottom (CC's pill: the
+      // affordance now exists whenever the view is off the bottom, not
+      // only with unseen rows).
       handle?.scrollToBottom()
+    } else if (key.end && !isSticky) {
+      // End = jump to bottom, less/vim semantics. Global on the chat
+      // screen (search/history overlays consume their own End first —
+      // cursor-to-line-end there). At the bottom already: no-op, so the
+      // key stays harmless in muscle memory.
+      handle?.scrollToBottom()
+      event.stopImmediatePropagation()
     } else if (extensionShortcuts !== undefined && extensionShortcuts.dispatch(input, key)) {
       // Plugin shortcut (tuiShortcuts seam): matched only after every
       // built-in global binding above declined — locals always win, and the
@@ -2062,11 +2399,50 @@ export function Chat({
     return fullscreen ? screen : <AlternateScreen>{screen}</AlternateScreen>
   }
 
-  /** Prompt input is inert while a modal dialog owns the keyboard. */
+  // Subagent detail scene: displays detailed view of a specific subagent.
+  // Like the browser and settings, it replaces the conversation entirely.
+  if (subagentDetailId !== null) {
+    const subagent = channel.subagents.find(s => s.agentId === subagentDetailId)
+    if (!subagent) {
+      // Agent not found, go back to dashboard
+      setSubagentDetailId(null)
+      setSubagentDashboardOpen(true)
+      return null
+    }
+    const scene = (
+      <SubagentDetailScene
+        subagent={subagent}
+        onInterrupt={(id) => channel.subagentControl.interrupt(id)}
+        onBack={() => {
+          setSubagentDetailId(null)
+          setSubagentDashboardOpen(true)
+        }}
+      />
+    )
+    return fullscreen ? scene : <AlternateScreen>{scene}</AlternateScreen>
+  }
+
+  // Subagent dashboard: displays all active and completed subagents.
+  // Like the browser and settings, it replaces the conversation entirely.
+  if (subagentDashboardOpen) {
+    const dashboard = (
+      <SubagentDashboard
+        subagents={[...channel.subagents]}
+        onSelect={(id) => {
+          setSubagentDashboardOpen(false)
+          setSubagentDetailId(id)
+        }}
+        onClose={() => setSubagentDashboardOpen(false)}
+      />
+    )
+    return fullscreen ? dashboard : <AlternateScreen>{dashboard}</AlternateScreen>
+  }
+
+  /** Prompt input is inert while a modal dialog owns the keyboard. The
+   *  overlay union covers every picker/dialog and /tips in one check;
+   *  message-selection mode and the /btw panel live outside it. */
   const promptSelectionActive =
-    selectionActive || modelPickerOpen || skillsPickerOpen || workspacePickerOpen || workspaceFlow !== null || activityPickerOpen ||
-    effortSliderOpen || presetPickerOpen || themePickerOpen || thinkingOpen || historyOpen || rewindOpen || searchOpen ||
-    btw !== null || tipsOpen
+    selectionActive || overlay.kind !== 'none' || btw !== null
 
   // The trajectory scene replaces the conversation for as long as it is open.
   // Rendering it INSTEAD of (not above) the transcript is what makes it a
@@ -2081,38 +2457,62 @@ export function Chat({
     return fullscreen ? scene : <AlternateScreen>{scene}</AlternateScreen>
   }
 
-  // 浮层整体挂载条件：必须与内部各面板的可见条件精确同值。关闭时把
-  // 整个 absolute 浮层从树里移除——渲染器的"移除 absolute 节点"检测只看
-  // 被移除子树自身的 style.position（dom.ts collectRemovedRects），若浮层
-  // 常驻、只移除其普通子节点，blit 解毒不触发，被覆盖的转录行会在
-  // blit-skip 后留空（Esc 关 picker 一片空白的根因）。
-  const dialogOverlayOpen =
-    thinkingOpen || (workspacePickerOpen && workspaceTargets.length > 0) || workspaceFlow !== null ||
-    modelPickerOpen || skillsPickerOpen ||
-    activityPickerOpen || (effortSliderOpen && effortOptions.length > 1) ||
-    (presetPickerOpen && presetOptions.length > 0) || themePickerOpen || historyOpen ||
-    rewindOpen || searchOpen || tipsOpen
+  // 浮层整体挂载条件：与内部各面板的可见条件同值（数据门在
+  // dialogOverlayVisible 里逐面板镜像）。关闭时把整个 absolute 浮层从树里
+  // 移除——渲染器的"移除 absolute 节点"检测只看被移除子树自身的
+  // style.position（dom.ts collectRemovedRects），若浮层常驻、只移除其
+  // 普通子节点，blit 解毒不触发，被覆盖的转录行会在 blit-skip 后留空
+  // （Esc 关 picker 一片空白的根因）。
+  const dialogOverlayOpen = dialogOverlayVisible(overlay, {
+    workspaceTargetCount: workspaceTargets.length,
+    effortOptionCount: effortOptions.length,
+    presetOptionCount: presetOptions.length,
+  })
+
+  // The sticky header pins the turn owning the viewport top row
+  // (timeline.activeId, reported by MessageList) — scrolled up to an old
+  // turn, it carries THAT turn's prompt, not the latest one.
+  // channel.rows is a live in-place array, so the lookup is per-render.
+  const anchorUserRowId = timeline.activeId
+  const anchorUserText =
+    anchorUserRowId === null
+      ? null
+      : channel.rows.find(row => row.id === anchorUserRowId)?.text ?? null
 
   return (
     <Box ref={wakeTickRef} flexDirection="column" flexGrow={1} width="100%">
-      {!isSticky && channel.lastUserText && (
+      {!isSticky && anchorUserText && (
         <StickyPromptHeader
-          text={channel.lastUserText}
+          text={anchorUserText}
           onClick={() => {
-            // Click jumps back to the pinned prompt (CC's StickyPromptHeader).
-            const lastUser = [...channel.rows].reverse().find(row => row.kind === 'user')
-            if (lastUser) seekRow(lastUser.id)
+            // Click snaps the pinned prompt to the viewport top (CC's
+            // StickyPromptHeader). Jump by the SAME content coordinate the
+            // rail's tick uses (timeline turn top = the prompt TEXT top):
+            // the element-based seek lands the row wrapper's margin at the
+            // top instead — one row shy of the text top the anchor rule
+            // compares against — and the header would flip to the previous
+            // turn immediately after the click.
+            const turn = timeline.turns.find(t => t.id === anchorUserRowId)
+            if (turn) handle?.scrollTo(turn.top)
+            else if (anchorUserRowId !== null) seekRow(anchorUserRowId)
             else handle?.scrollToBottom()
           }}
         />
       )}
-      <ScrollBox ref={setHandle} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
+      <Box flexDirection="row" flexGrow={1} flexShrink={1} width="100%">
+        <ScrollBox ref={setHandle} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
         <LogoHeader
           key={logoNonce}
           model={channel.model}
           effort={channel.reasoningEffort}
           cwd={channel.displayCwd}
           whale={channel.whale}
+          // Resuming a long session skips the ~3.4s opening animation: it
+          // keeps firing low-frequency React commits that compete with the
+          // transcript mount batches (and the first wheel events) for the
+          // frame budget right when the user wants to read history. Fresh
+          // sessions keep the full intro; restored ones settle instantly.
+          skipIntro={channel.rows.length > 30}
         />
         {/* The startup loaded-context panel: before the first message the
             transcript is empty, so the inventory of what this conversation
@@ -2134,12 +2534,16 @@ export function Chat({
           expandedRows={expandedRows}
           selectedId={selectionActive ? selectedId : null}
           onToggleRow={toggleRowExpanded}
+          streamFoldedRows={streamFoldedRows}
+          onToggleStreamFold={toggleStreamFolded}
           model={channel.model}
           diffLayout={channel.diffLayout}
           thinkingFold={channel.thinkingFold}
           toolBackground={channel.toolBackground}
+          activityFrames={channel.activityFrames}
           showAll={showAllMessages}
           thinkingVisible={thinkingVisible}
+          historyPaintEnabled={!fullscreen}
           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
           onLoadOlder={() => channel.loadOlder()}
           registerRowRef={registerRowRef}
@@ -2147,8 +2551,35 @@ export function Chat({
           forceMountRowId={forceMountRowId}
           newSinceRowId={isSticky ? null : lastSeenRowIdRef.current}
           onUnseenCount={setUnseenCount}
+          onTimeline={setTimeline}
+          onOpenSubagent={(agentId) => setSubagentDetailId(agentId)}
         />
-      </ScrollBox>
+        </ScrollBox>
+        {(() => {
+          // Gutter mode (settings `dsh-tui.scrollGutter`): the timeline
+          // rail (default), the proportional scrollbar, or nothing. The
+          // slot keeps its 2 columns in both rendered modes (Qwen's
+          // permanent-gutter rule — an appearing/disappearing gutter
+          // changes the transcript width and rewraps everything).
+          const gutter = normalizeScrollGutter(channel.scrollGutter)
+          if (gutter === 'hidden') return null
+          if (gutter === 'scrollbar') {
+            return <ScrollbarGutter handle={handle} terminalWidth={terminalColumns} />
+          }
+          return (
+            <TimelineRail
+              handle={handle}
+              turns={timeline.turns}
+              activeId={timeline.activeId}
+              upId={timeline.upId}
+              downId={timeline.downId}
+              terminalWidth={terminalColumns}
+              hoverEnabled={!promptSelectionActive}
+              onRevealTurn={revealAndSeekRow}
+            />
+          )
+        })()}
+      </Box>
       {/* Bottom chrome (pill, spinners, dialogs, prompt, statusline): never
           let flex shrink squeeze these fixed-height rows — the ScrollBox
           above absorbs all overflow (it is the scroll container). */}
@@ -2161,6 +2592,7 @@ export function Chat({
         )}
         {channel.working &&
           (channel.activityEnabled &&
+          !channel.minimal &&
           channel.workingActivity !== undefined &&
           channel.workingActivity.line !== '' &&
           channel.workingActivity.phase !== 'idle' ? (
@@ -2197,7 +2629,11 @@ export function Chat({
                 thinkingStatus={thinkingStatus}
               />
             ))}
-        <GoalTodoPanel channel={channel} />
+        <GoalTodoPanel
+          channel={channel}
+          collapsed={todoCollapsed}
+          onToggle={() => setTodoCollapsed(previous => !previous)}
+        />
         {statusEntries.length > 0 && (
           // Plugin status contributions (tuiStatus seam): one joined line,
           // truncated by the Text wrap contract — the host owns the layout,
@@ -2219,9 +2655,9 @@ export function Chat({
             onDecide={value => dialogs.decide(dialogSnapshot.key, value)}
             onCancel={() => dialogs.cancel(dialogSnapshot.key)}
           />
-        ) : tipsOpen ? (
+        ) : overlay.kind === 'tips' ? (
           <Box flexDirection="column" marginTop={1}>
-            <TipsPanel onClose={() => setTipsOpen(false)} />
+            <TipsPanel onClose={() => dispatchOverlay({ type: 'close-if', kind: 'tips' })} />
           </Box>
         ) : btw !== null ? (
           <Box flexDirection="column" marginTop={1}>
@@ -2280,112 +2716,266 @@ export function Chat({
             一份启动画的根因）。maxHeight 预留 prompt/statusline 行，防短会话
             高列表探出帧顶。整体条件挂载：见 dialogOverlayOpen 注释。 */}
         {dialogOverlayOpen && (
-        <OverlayAbove maxHeight={Math.max(terminalRows - 8, 8)}>
-          {thinkingOpen && (
+        <OverlayAbove maxHeight={Math.max(terminalRows - 8, 1)}>
+          {overlay.kind === 'thinking' && (
             <ThinkingToggle
               currentValue={thinkingVisible}
-              focusIndex={thinkingFocus}
+              focusIndex={overlay.focus}
+              onPick={(index) => {
+                // 点击行 = 设焦点 + 应用（与 Enter 同一条路径）
+                const visible = index === 0
+                setThinkingVisible(visible)
+                dispatchOverlay({ type: 'close' })
+                channel.notify(t('thinking-toggled', { state: visible ? t('thinking-on') : t('thinking-off') }))
+              }}
             />
           )}
-          {workspacePickerOpen && workspaceTargets.length > 0 && (
+          {overlay.kind === 'workspace-picker' && workspaceTargets.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               <WorkspacePicker
                 targets={workspaceTargets}
-                focusIndex={workspaceIndex}
+                focusIndex={overlay.index}
                 currentCwd={channel.cwd}
+                onPick={(index) => {
+                  // 点击行 = 切换该行目标（与 Enter 同一条路径）
+                  const target = workspaceTargets[index]
+                  dispatchOverlay({ type: 'close' })
+                  if (target !== undefined) void channel.switchWorkspace(target)
+                }}
               />
             </Box>
           )}
-          {workspaceFlow !== null && (
+          {overlay.kind === 'workspace-menu' && (
+            <Box flexDirection="column" marginTop={1}>
+              <WorkspaceMenuPicker
+                options={workspaceMenuOptions}
+                focusIndex={overlay.index}
+                onPick={(index) => {
+                  // 点击行 = 执行该行（与 Enter 同一条路径）
+                  runWorkspaceMenuOption(workspaceMenuOptions[index])
+                }}
+              />
+            </Box>
+          )}
+          {overlay.kind === 'workspace-flow' && (
             <Box flexDirection="column" marginTop={1}>
               <WorkspaceFlowPicker
-                title={workspaceFlow.title}
-                choices={workspaceFlow.choices}
-                focusIndex={workspaceFlowIndex}
-                busy={workspaceFlowBusy}
-                input={workspaceFlowInput}
+                title={overlay.flow.title}
+                choices={overlay.flow.choices}
+                focusIndex={overlay.index}
+                busy={overlay.busy}
+                input={overlay.input}
+                onPick={(index) => {
+                  // 点击行 = 设焦点 + 执行分支（与 Enter 同一条路径）；
+                  // busy/输入态在组件侧禁点
+                  const choice = overlay.flow.choices[index]
+                  if (choice === undefined) return
+                  dispatchOverlay({ type: 'set-index', kind: 'workspace-flow', index })
+                  runWorkspaceFlowAction(signal => choice.choose(signal))
+                }}
               />
             </Box>
           )}
-          {modelPickerOpen && (
+          {overlay.kind === 'model' && (
             <Box flexDirection="column" marginTop={1}>
               {models.length === 0 ? (
                 <ModelPickerLoading />
               ) : (
                 <ModelPicker
                   models={models}
-                  focusIndex={modelIndex}
+                  focusIndex={overlay.index}
                   currentModel={`${channel.provider}/${channel.model}`}
+                  onPick={(index) => {
+                    // 点击行 = 应用该行模型（与 Enter 同一条路径）
+                    const model = models[index]
+                    if (!model) return
+                    dispatchOverlay({ type: 'close' })
+                    channel.notify(t('model-switching', { name: model.name }))
+                    void channel.switchModel(model.provider, model.id).then((ok) => {
+                      if (ok) channel.notify(t('model-switched', { name: model.name }))
+                    })
+                  }}
                 />
               )}
             </Box>
           )}
-          {skillsPickerOpen && (
+          {overlay.kind === 'skills' && (
             <Box flexDirection="column" marginTop={1}>
               {skillsList === null ? (
                 <SkillsPickerLoading />
               ) : (
                 <SkillsPicker
                   skills={skillsList}
-                  focusIndex={skillsIndex}
+                  focusIndex={overlay.index}
+                  onPick={(index) => {
+                    const skill = skillsList[index]
+                    if (!skill) return
+                    dispatchOverlay({ type: 'close' })
+                    if (skill.userInvocable) setHistoryFill(`/${skill.name} `)
+                  }}
                 />
               )}
             </Box>
           )}
-          {activityPickerOpen && (
+          {overlay.kind === 'activity' && (
             <Box flexDirection="column" marginTop={1}>
               <ActivityPicker
-                focusIndex={activityIndex}
+                focusIndex={overlay.index}
                 currentPreset={channel.activityFrames}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const name = PRESET_NAMES[index]
+                  if (name) channel.setActivityFrames(name)
+                }}
               />
             </Box>
           )}
-          {effortSliderOpen && effortOptions.length > 1 && (
+          {overlay.kind === 'effort' && effortOptions.length > 1 && (
             <Box flexDirection="column" marginTop={1}>
               <EffortSlider
                 options={effortOptions}
-                focusIndex={effortIndex}
+                focusIndex={overlay.index}
                 currentId={channel.reasoningEffort}
+                // 点击档位 = 移到该档并即时应用（与 ←/→ 同语义）
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'set-index', kind: 'effort', index })
+                  const option = effortOptions[index]
+                  if (option) void channel.setEffort(option.id)
+                }}
               />
             </Box>
           )}
-          {presetPickerOpen && presetOptions.length > 0 && (
+          {overlay.kind === 'preset' && presetOptions.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               <PresetPicker
                 presets={presetOptions}
-                focusIndex={presetIndex}
+                focusIndex={overlay.index}
                 currentPreset={channel.agentPreset}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const option = presetOptions[index]
+                  if (option) void channel.switchPreset(option.id)
+                }}
               />
             </Box>
           )}
-          {themePickerOpen && (
+          {overlay.kind === 'permission' && (
             <Box flexDirection="column" marginTop={1}>
-              <ThemePicker focusIndex={themeIndex} currentTheme={themeName} />
+              <PermissionsPicker
+                focusIndex={overlay.index}
+                currentMode={channel.mode.sandbox}
+                cwd={channel.cwd}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const id = PERMISSION_PRESET_IDS[index]
+                  if (id !== undefined) {
+                    void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
+                      if (text !== undefined && text !== '') channel.notify(text)
+                    })
+                  }
+                }}
+              />
             </Box>
           )}
-          {historyOpen && (
+          {overlay.kind === 'plan' && (
+            <Box flexDirection="column" marginTop={1}>
+              <PlanPicker
+                focusIndex={overlay.index}
+                currentOn={channel.mode.plan === true}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const on = index === 0
+                  void channel.runExternalCommand('plan', on ? '' : ' off').then((text) => {
+                    if (text !== undefined && text !== '') channel.notify(text)
+                  })
+                }}
+              />
+            </Box>
+          )}
+          {overlay.kind === 'lang' && (
+            <Box flexDirection="column" marginTop={1}>
+              <LangPicker
+                focusIndex={overlay.index}
+                currentLang={getLang()}
+                onPick={(index) => {
+                  const lang = LANGS[index]
+                  if (lang === undefined) return
+                  dispatchOverlay({ type: 'close' })
+                  applyLang(lang)
+                }}
+              />
+            </Box>
+          )}
+          {overlay.kind === 'theme' && (
+            <Box flexDirection="column" marginTop={1}>
+              <ThemePicker
+                focusIndex={overlay.index}
+                currentTheme={themeName}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const name = getThemeOptions()[index]?.value
+                  if (name !== undefined) {
+                    const ok = setTheme(name)
+                    channel.notify(
+                      ok ? t('theme-switched-saved', { name }) : t('theme-switch-failed', { name }),
+                      { color: ok ? 'success' : 'error' },
+                    )
+                  }
+                }}
+              />
+            </Box>
+          )}
+          {overlay.kind === 'history' && (
             <Box flexDirection="column" marginTop={1}>
               <HistorySearchDialog
-                query={historyQuery}
-                cursorOffset={historyCursor}
+                query={overlay.query}
+                cursorOffset={overlay.cursor}
                 matches={historyMatches}
-                focusIndex={historyFocus}
+                focusIndex={overlay.focus}
+                onPick={(index) => {
+                  // 点击行 = 填入该历史命令（与 Enter 同路径）
+                  const entry = historyMatches[index]
+                  if (entry) {
+                    setHistoryFill(entry.text)
+                    dispatchOverlay({ type: 'close' })
+                  }
+                }}
               />
             </Box>
           )}
-          {rewindOpen && (
+          {overlay.kind === 'rewind' && (
             <Box flexDirection="column" marginTop={1}>
               <RewindPicker
                 rows={rewindRows}
-                focusIndex={rewindIndex}
-                confirmRow={rewindConfirm}
-                modes={rewindModes}
-                modeIndex={rewindModeIndex}
-                busy={rewindBusy}
+                focusIndex={overlay.index}
+                confirmRow={overlay.confirm}
+                modes={overlay.modes}
+                modeIndex={overlay.modeIndex}
+                busy={overlay.busy}
+                onPickRow={(index) => {
+                  // 列表页点击只选中：进入确认态保留键盘 Enter 显式触发
+                  dispatchOverlay({ type: 'set-index', kind: 'rewind', index })
+                }}
+                onConfirm={() => {
+                  // 确认页即显式确认层，点击直接执行（与 Enter 同路径）
+                  const row = overlay.confirm
+                  if (row === null) return
+                  dispatchOverlay({ type: 'close' })
+                  void performRewind(row)
+                }}
+                onPickMode={(index) => {
+                  // 模式列表点击直接执行该模式（与 Enter 同路径）
+                  const row = overlay.confirm
+                  if (row === null) return
+                  // 模式页仅当 modes 非空才渲染，这里空安全取值
+                  const mode = index === 0 ? null : (overlay.modes?.[index - 1]?.id ?? null)
+                  dispatchOverlay({ type: 'close' })
+                  void performRewind(row, mode)
+                }}
               />
             </Box>
           )}
-          {searchOpen && <TranscriptSearchBar query={searchQuery} cursorOffset={searchCursor} count={searchCount} current={searchCurrent} />}
+          {overlay.kind === 'search' && <TranscriptSearchBar query={searchQuery} cursorOffset={searchCursor} count={searchCount} current={searchCurrent} />}
         </OverlayAbove>
         )}
       </Box>
@@ -2396,7 +2986,11 @@ export function Chat({
 /**
  * The pinned prompt header shown above the ScrollBox while the user has
  * scrolled up (mirroring Claude Code's FullscreenLayout.StickyPromptHeader).
- * Fixed at 1 row so the ScrollBox never shifts when the text changes.
+ * Pins the user message the transcript viewport is currently showing — the
+ * topmost visible user message, or the nearest one above when only assistant
+ * content fills the view — so it tracks which turn the user is reading
+ * instead of always carrying the latest prompt. Fixed at 1 row so the
+ * ScrollBox never shifts when the text changes.
  */
 function StickyPromptHeader({
   text,
@@ -2438,7 +3032,11 @@ function NewMessagesPill({
         onMouseLeave={() =>{  setHover(false) }}
       >
         <Text color="inverseText" bold>
-          {' '}↓ {t(count === 1 ? 'new-message' : 'new-messages', { n: count })}{' '}
+          {' '}
+          {count > 0
+            ? t(count === 1 ? 'new-message' : 'new-messages', { n: count })
+            : t('back-to-bottom')}
+          {' '}
         </Text>
       </Box>
     </Box>

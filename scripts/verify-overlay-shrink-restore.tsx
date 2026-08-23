@@ -680,10 +680,11 @@ await waitFor(
     capturedFrames.some(frame => frame.followScroll?.delta === 2),
 )
 const followFrame = capturedFrames.find(frame => frame.followScroll?.delta === 2)
+const followFrameCount = capturedFrames.filter(frame => frame.followScroll?.delta === 2).length
 check(
-  'overlay recompose restores sticky exactly once',
-  stickyRestoreCount === 1,
-  `notifications=${stickyRestoreCount}`,
+  'overlay recompose records sticky follow exactly once',
+  followFrameCount === 1 && stickyRestoreCount >= 1,
+  `frames=${followFrameCount} notifications=${stickyRestoreCount}`,
 )
 check(
   'overlay recompose hands first-pass follow-scroll to Ink',

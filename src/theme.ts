@@ -115,6 +115,15 @@ export type Theme = {
   rainbow_blue_shimmer: string
   rainbow_indigo_shimmer: string
   rainbow_violet_shimmer: string
+  // Subagent message colors
+  subagentBullet: string
+  subagentDescription: string
+  subagentModel: string
+  subagentElapsed: string
+  subagentToolName: string
+  subagentStatusRunning: string
+  subagentStatusCompleted: string
+  subagentStatusFailed: string
 }
 
 /** The built-in theme names, in display order. */
@@ -258,6 +267,14 @@ const darkTheme: Theme = {
   rainbow_blue_shimmer: rgb('#AFBFE2'),
   rainbow_indigo_shimmer: rgb('#BFB4DE'),
   rainbow_violet_shimmer: rgb('#D1B4D1'),
+  subagentBullet: rgb('#D194AE'),
+  subagentDescription: rgb('#E8E6E0'),
+  subagentModel: rgb('#8D95A6'),
+  subagentElapsed: rgb('#8D95A6'),
+  subagentToolName: rgb('#7DA1DE'),
+  subagentStatusRunning: rgb('#7DA1DE'),
+  subagentStatusCompleted: rgb('#82B89D'),
+  subagentStatusFailed: rgb('#DA8A93'),
 }
 
 /**
@@ -355,6 +372,14 @@ const lightTheme: Theme = {
   rainbow_blue_shimmer: rgb('#A9BCE0'),
   rainbow_indigo_shimmer: rgb('#B7AFD8'),
   rainbow_violet_shimmer: rgb('#CFB0CC'),
+  subagentBullet: rgb('#C07A93'),
+  subagentDescription: rgb('#343945'),
+  subagentModel: rgb('#8991A0'),
+  subagentElapsed: rgb('#8991A0'),
+  subagentToolName: rgb('#3F6CC4'),
+  subagentStatusRunning: rgb('#3F6CC4'),
+  subagentStatusCompleted: rgb('#4E9675'),
+  subagentStatusFailed: rgb('#C65D6B'),
 }
 
 /**
@@ -454,6 +479,14 @@ const darkAnsiTheme: Theme = {
   rainbow_blue_shimmer: 'ansi:cyanBright',
   rainbow_indigo_shimmer: 'ansi:blueBright',
   rainbow_violet_shimmer: 'ansi:magentaBright',
+  subagentBullet: 'ansi:magentaBright',
+  subagentDescription: 'ansi:whiteBright',
+  subagentModel: 'ansi:white',
+  subagentElapsed: 'ansi:white',
+  subagentToolName: 'ansi:cyanBright',
+  subagentStatusRunning: 'ansi:blueBright',
+  subagentStatusCompleted: 'ansi:greenBright',
+  subagentStatusFailed: 'ansi:redBright',
 }
 
 /**

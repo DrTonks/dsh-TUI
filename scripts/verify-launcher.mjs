@@ -95,7 +95,7 @@ function stubCalls() {
   return readFileSync(stubLog, 'utf8').trim().split('\n').filter(Boolean)
 }
 
-function runBin(args, extraEnv = {}) {
+function runBin(args, extraEnv = {}, { delegating = false } = {}) {
   return spawnSync(process.execPath, [bin, ...args], {
     env: {
       PATH: stubPath,
@@ -108,6 +108,9 @@ function runBin(args, extraEnv = {}) {
       // 启动器 spawn(shell:true) 在 Windows 触 DEP0190 弃用警告，
       // 会污染「静默启动」类断言的 stderr——测试环境下关掉。
       NODE_OPTIONS: '--no-deprecation',
+      // 0.8.7 双态启动器：默认强制完整逻辑（本套回归覆盖的全量路径）；
+      // 委托角色的专门用例按需放开（见第 4 节）。
+      ...(delegating ? {} : { DSH_TUI_NO_DELEGATE: '1' }),
       ...extraEnv,
     },
     encoding: 'utf8',
@@ -239,6 +242,45 @@ check(
   'launcher env: child receives DSH_TUI_LAUNCHER_VERSION',
   launcherSource.includes('process.env.DSH_TUI_LAUNCHER_VERSION = ownVersion'),
 )
+
+// --- 4. 委托角色（0.8.7 双态启动器）：全局副本 → profile 内副本 -------------
+// 真实 bin + 假 DSH_HOME：repo 目录与假 profile 不是同一物理目录 → 走瘦壳
+// 角色。把真实 bin 预放进假 profile（模拟一次完成的安装），验证：
+//   - 委托后由 profile 内副本执行完整逻辑（argv 原样两跳转发）
+//   - 判定文件缺失（残骸 profile）时瘦壳先自举再委托
+//   - profile 有判定文件但没有 bin 时 fail loud 给重装指引
+const placeProfileBin = () => {
+  const dir = join(home, PKG_DIR, 'bin')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'dsh-tui.js'), readFileSync(bin, 'utf8'))
+}
+
+setProfileVersion(ownVersion)
+placeProfileBin()
+resetStubLog()
+r = runBin(['foo', 'a b'], {}, { delegating: true })
+check('shim: delegates argv through to the profile copy', stubCalls().at(-1) === '<--profile><dsh-tui><foo><a b>')
+check('shim: silent + exit 0 when aligned', r.status === 0 && r.stderr.trim() === '')
+
+setProfileVersion(undefined)
+placeProfileBin() // add stub 只创建 package.json——bin 是预放好的“已安装”产物
+resetStubLog()
+r = runBin([], {}, { delegating: true })
+check(
+  'shim: bootstraps a broken profile before delegating',
+  stubCalls().some(c => c.includes('<plugin>') && c.includes('<add>'))
+    && stubCalls().at(-1) === '<--profile><dsh-tui>'
+    && r.status === 0,
+)
+
+// 判定文件在、bin 缺失：委托目标不可读——给出全局重装指引而非 opaque 崩溃。
+setProfileVersion(ownVersion)
+rmSync(join(home, PKG_DIR, 'bin'), { recursive: true, force: true })
+resetStubLog()
+r = runBin([], { DSH_TUI_LANG: 'en' }, { delegating: true })
+check('shim: no bin fails loud with the reinstall hint', r.status === 1 && r.stderr.includes(`Reinstall the global launcher`))
+check('shim: reinstall hint names the npm command', r.stderr.includes(`npm install -g ${PACKAGE}`))
+
 
 // --- 5. 消息双语：缺 dsh 时的报错（契约同 TUI：DSH_TUI_LANG 指定才生效，否则默认中文）
 const envNoDsh = { PATH: noDshPath }

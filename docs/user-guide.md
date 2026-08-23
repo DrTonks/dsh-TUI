@@ -33,6 +33,8 @@ dsh-tui
 - `dsh-tui --resume`：恢复上次会话；Windows 可用仓库里的 `dsh-tui.cmd`（等价）。
 - `dsh --profile dsh-tui`：与 `dsh-tui` 等价的手工启动方式（`/update` 仅此方式可用）。
 - 运行模型需要 `DEEPSEEK_API_KEY`；环境自检用 `/doctor`。
+- 支持的 dsh 引擎版本：`0.1.0-rc.6` ～ `0.1.1-rc.2`（含 rc.7/rc.8、0.1.1-rc.1）。
+  更老或更新的版本仍可启动，但 logo 页会提示版本漂移并给出对齐命令。
 
 ### 1.2 首次启动你会看到
 
@@ -40,6 +42,8 @@ dsh-tui
    `✦ dsh-TUI` 版本号、`DEEPSEEK / HARNESS` 大字、当前模型与 effort、工作目录，
    以及一行**启动提示**（`/model` 切换模型 · `/help` 查看命令 · `Tab` 自动补全）。
    终端宽度 < 64 列时鲸鱼隐藏、仅保留文字列。
+   若 dsh 引擎版本不在验证范围内，提示行下方会出现一行 **⚠ 版本漂移警告**
+   （更新/更旧/混装/异常四形态），附对齐命令（`npm i -g @deepseek-ai/dsh@<版本>`）。
 2. **底部状态栏**：工作状态行、上下文进度条、TPS 仪表与各类实时指标（见
    [5. 界面与状态栏](#5-界面与状态栏)）。
 3. 输入 `/` 看命令菜单，按 `?` 看快捷键帮助。
@@ -97,7 +101,7 @@ dsh-tui
 |---|---|
 | `←` / `→` | 按字符移动光标 |
 | `Ctrl+←` / `Ctrl+→`（⌘←/→） | 按词跳转 |
-| `Home` / `End`，`Ctrl+A` / `Ctrl+E` | 逻辑行首 / 行尾 |
+| `Home` / `End`，`Ctrl+E` | 逻辑行首 / 行尾（`Ctrl+A` 已改用于子代理面板，见 §2.7） |
 | `Ctrl+U` / `Ctrl+K` | 删除光标前（至行首）/ 光标后（至行尾） |
 | `Ctrl+W` | 删除前一个单词 |
 | `Backspace` / `Delete` | 删前一 / 后一字符 |
@@ -122,7 +126,7 @@ dsh-tui
 |---|---|
 | 左键拖拽 | 选文本，**松开即复制**（OSC 52 + wl-copy/xclip/xsel 兜底），自动取消选区 |
 | 双击 / 三击 | 选词 / 选行，即选即复制 |
-| 滚轮 | 滚动消息列表（±3 行/格） |
+| 滚轮 | 滚动消息列表（±3 行/格）；**有文本选区时随内容平移选区**（双向，两端越出视口自动取消选区） |
 | `Esc` | 取消选区（不复制） |
 | 单击消息行 | 展开/收起该行 |
 | 单击「加载更早消息」/「ctrl+e 显示前 N 条」 | 加载更早消息 / 展开全部 |
@@ -167,7 +171,16 @@ dsh-tui
 
 **@ 文件补全**
 `@` 在消息任意位置触发 · `↑/↓` 移动 · `Tab`/`Enter` 接受 · 目录可继续深入 ·
-匹配路径前缀**或 basename**（`@ink` 命中 `src/ink/Box.js`）· `Esc` 只关当前 token 菜单
+`Esc` 只关当前 token 菜单
+- **两种查询模式**：路径形输入（`@src/` `@./` `@~/` `@D:\`，含任意路径分隔符）只列该目录；
+  普通片段走**模糊子序列匹配**（前缀/边界加权，`@ink` 也能命中 `src/ink/Box.js`）。
+- 文件与目录**双预算各 100**；接受按条目类型判定（文件=插入引用、目录=继续深入）。
+- 粘贴/输入图片路径自动变 `[Image #N]` 附件。
+
+**子代理面板（Ctrl+A）**
+`↑/↓` 浏览 · `Enter` 查看详情 · `Esc` 关闭；详情页 `←/→` 翻页（概览 / 输出流 / 工具与 token），
+运行中可按 `X` 中断 · `Esc` 返回。聊天流里子代理以卡片行实时展示（运行中三行瀑布，
+落定后折叠为标题行；对应的 Task 工具卡被抑制）。
 
 **双击 Esc 时间回溯（rewind）**
 列表 `↑/↓` + `Enter` 进入确认 · 确认页 `Enter` 回退 / `Esc` 返回 · 插件决策等待中只响应 `Esc`
@@ -377,6 +390,8 @@ dsh-tui
 - **开场动画**（约 3.4 秒，只播一次）：眨眼 → 喷水花 ×6 → 摇尾，之后定格为静态鲸鱼。
 - 鲸鱼右侧文字列：`✦ dsh-TUI v版本号` → 5 行块体大字 `DEEPSEEK / HARNESS`（品牌蓝渐变）
   → 当前模型 + effort → 工作目录 → **启动提示行**（`/model` 切换模型 · `/help` 查看命令 · `Tab` 自动补全）。
+  若 dsh 引擎版本不在验证范围内，提示行下方会多出一行 **⚠ 版本漂移警告**
+  （更新/更旧/混装/异常四形态，附 `npm i -g @deepseek-ai/dsh@<版本>` 对齐命令）。
 - 鲸鱼下方居中的欢迎语：`探索未至之境！`（Explore the uncharted!）。
 - 终端宽度 **< 64 列时隐藏鲸鱼**，仅保留文字列。
 
@@ -388,9 +403,9 @@ dsh-tui
 
 **Row 2 — 状态字段行**（每个字段独立开关，见 `/settings`）
 - 左组：模型 → TPS → thinking 推理等级 → mode 会话模式 → ctx 上下文占用 → cache 缓存命中率 → tokens（`1.2k→340` 输入→输出）
-- 右组：git 分支 → 工作目录（紧凑模式仅 basename）→ 会话标题
+- 右组：git 分支 → 工作目录（紧凑模式仅 basename）→ 会话标题 → 短会话 ID（`#` + 前 8 位，与日志文件名对应，方便 `--resume` 定位）
 - `statusBar.compact` 时左右合并为单行。
-- 默认开：compact / model / thinking / cwd / contextUsage / cache；默认关：tokens / tps / gitBranch / sessionTitle / mode / contextBar / activity / trajectory。
+- 默认开：compact / model / thinking / cwd / contextUsage / cache；默认关：tokens / tps / gitBranch / sessionTitle / sessionId / mode / contextBar / activity / trajectory。
 
 **Row 3 — 提示 / 工作活动 + 迷你轨迹条**
 - 空闲显示 `? for shortcuts`，回合运行中显示 `esc to interrupt`，消息选择中显示 `esc to return to input`。
@@ -416,7 +431,7 @@ dsh-tui 自身区块（写入 settings.yaml 用户层，实时生效）共 19 �
 | diffLayout | Edit/Write diff 布局：auto（≥110 列双栏）/ split / unified |
 | thinkingFold | 思考块：preview（流式 2-3 行预览 + 落定折叠）/ full（展开到轮末） |
 | toolBackground | 工具卡背景强调：none / subtle / strong |
-| statusBar.* | 上表全部状态栏开关（compact/model/thinking/cwd/contextUsage/cache/tokens/tps/gitBranch/sessionTitle/mode/contextBar/activity/trajectory） |
+| statusBar.* | 上表全部状态栏开关（compact/model/thinking/cwd/contextUsage/cache/tokens/tps/gitBranch/sessionTitle/sessionId/mode/contextBar/activity/trajectory；statusBar.sessionId 是底栏显示开关，与 cordis 的启动 sessionId 无关） |
 
 未声明 TUI 区块的命名空间以只读形式列出，需手工编辑 `~/.dsh/settings.yaml`。
 provider / model / cwd / effort / fullscreen / preset / workspace / sessionId / modes
@@ -472,9 +487,9 @@ provider / model / cwd / effort / fullscreen / preset / workspace / sessionId / 
 6. 想快速问个事又不想打断主回合、不想留历史：`/btw <问题>`。
 7. 打错了想重来：**空输入双击 Esc 时间回溯**，选你的消息改完重发；`/rewind` 同款。
 8. 长输入用 `Ctrl+G` 拉起 `$VISUAL` 编辑器写，保存即回填。
-9. `@` 在消息任意位置补全文件（匹配路径前缀或文件名，`@ink` 能命中 `src/ink/Box.js`）；
-   目录可继续深入；图片自动变 `[Image #N]` 附件。
-10. 粘贴不丢格式：右键 / `Ctrl+Shift+V` 原样插入；`Ctrl+V` 走应用剪贴板（文本/文件/位图）。
+9. `@` 在消息任意位置补全文件：普通片段**模糊匹配**（`@ink` 也能命中 `src/ink/Box.js`），
+   路径形输入（`@src/` `@./` `@~/`）**直达该目录**；目录可继续深入；图片自动变 `[Image #N]` 附件。
+10. 想盯着子代理干活：**`Ctrl+A` 打开子代理面板**，`Enter` 看详情、`X` 中断运行中的子代理。
 
 **查看与诊断**
 11. `Ctrl+O` 展开/收起工具卡详情（思考全文、参数与输出）；`Ctrl+E` 展开隐藏的旧消息。
@@ -493,14 +508,17 @@ provider / model / cwd / effort / fullscreen / preset / workspace / sessionId / 
     （帧名 30 个，`random` 随机）。
 19. `/model` 切换会 fork 续聊（历史保留），持久化后重启与 `/new` 沿用——放心换模型。
 20. 会话太多？`/resume` 里 `Ctrl+S` 折叠子 agent 运行、`Ctrl+X` 清理空壳会话。
+21. 有文本选区时滚轮是**平移选区**不是滚动列表——想滚屏先 `Esc` 取消选区。
 
 **避坑**
-21. `/compact`、`/model` 在回合运行中会被拒绝——先 `Ctrl+C` 或等回合结束。
-22. 审批条 `Esc` = 拒绝（fail closed）；问卷 `Esc` = 取消整批（模型会收到取消信号）。
-23. `/update` 只更新 profile runtime 不动全局安装；提示版本错位时按提示执行
+22. `/compact`、`/model` 在回合运行中会被拒绝——先 `Ctrl+C` 或等回合结束。
+23. 审批条 `Esc` = 拒绝（fail closed）；问卷 `Esc` = 取消整批（模型会收到取消信号）。
+24. `/update` 只更新 profile runtime 不动全局安装；提示版本错位时按提示执行
     `npm install -g @deepseek-harness-tui/dsh-tui@<版本>` 对齐启动器。
-24. macOS 的 ⌘ 键需要 iTerm2/kitty/WezTerm/ghostty/tmux；Terminal.app 用 Ctrl 即可。
-25. 鼠标拖选即复制（fullscreen 模式）；`DSH_TUI_DISABLE_MOUSE=1` 可临时关闭鼠标。
+25. macOS 的 ⌘ 键需要 iTerm2/kitty/WezTerm/ghostty/tmux；Terminal.app 用 Ctrl 即可。
+26. 鼠标拖选即复制（fullscreen 模式）；`DSH_TUI_DISABLE_MOUSE=1` 可临时关闭鼠标。
+27. logo 页出现 **⚠ 版本漂移警告**时按提示对齐 dsh 引擎：
+    `npm i -g @deepseek-ai/dsh@<版本>`（支持范围见 §1.1）。
 
 ---
 

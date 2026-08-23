@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gte, gt, lt, valid } from 'semver'
 import { shellQuote } from './utils/shellQuote.js'
@@ -266,6 +266,68 @@ export function isTransientUpdateFailure(stderr: string): boolean {
 }
 
 /**
+ * Best-effort migrate the GLOBAL launcher to the delegating shim (0.8.7):
+ * after a successful profile update, copy this package's `bin/dsh-tui.js`
+ * and `package.json` over the global install so the launcher can never lag
+ * the profile again — the shim delegates all logic to the profile copy it
+ * just updated. Single-file-safe by contract: the new bin imports nothing
+ * from lib/ (see its header), so overwriting it inside an older global
+ * install cannot dangle a missing helper.
+ *
+ * Locating the global dir relies on argv[1] being the global `dsh-tui.js`
+ * (true when booted through the `dsh-tui` command). Source checkouts and
+ * direct `dsh --profile` boots resolve nothing — the migration is a silent
+ * no-op there. Write failures (permissions, locked files) are equally
+ * silent: the launcher-alignment warning remains the fallback diagnosis.
+ *
+ * @returns true when the global launcher files were replaced.
+ */
+export function migrateGlobalLauncher(): boolean {
+  const launcherBin = process.argv[1]
+  if (launcherBin === undefined || !launcherBin.endsWith('dsh-tui.js')) return false
+  // Walk up from the bin to the containing package; accept it only when it
+  // is OUR package and not the profile copy we are running from (junction
+  // layouts collapse both onto the same real path — copying onto ourselves
+  // would be a no-op at best).
+  let dir = dirname(resolve(launcherBin))
+  const ownDir = dirname(dirname(fileURLToPath(import.meta.url)))
+  for (let depth = 0; depth < 4; depth++) {
+    const manifest = join(dir, 'package.json')
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(manifest, 'utf8'))
+      if (
+        parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        && (parsed as Record<string, unknown>).name === PACKAGE_NAME
+      ) {
+        let same = false
+        try {
+          same = realpathSync(dir) === realpathSync(ownDir)
+        } catch {
+          same = resolve(dir) === resolve(ownDir)
+        }
+        if (same) return false
+        // tmp + rename keeps each file atomic; a crash mid-migration leaves
+        // either the old or the new file, never a truncated one.
+        const replace = (target: string, source: string): void => {
+          const staged = `${target}.dsh-tui-migrate`
+          writeFileSync(staged, readFileSync(source))
+          renameSync(staged, target)
+        }
+        replace(join(dir, 'bin', 'dsh-tui.js'), join(ownDir, 'bin', 'dsh-tui.js'))
+        replace(manifest, join(ownDir, 'package.json'))
+        return true
+      }
+    } catch {
+      // Unreadable manifest at this level — keep walking up.
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return false
+    dir = parent
+  }
+  return false
+}
+
+/**
  * Update the installed dsh-tui package and restart the same launcher while
  * preserving the active session. The TUI must already be unmounted before
  * this is called so pnpm output cannot corrupt the rendered terminal frame.
@@ -345,6 +407,14 @@ export async function updateTuiAndRestart(
       )
       return { updateCode: 1, restartCode: 1 }
     }
+  }
+
+  // Launcher migration (0.8.7): the freshly installed profile carries the
+  // delegating shim — stamp it over the global launcher so this is the LAST
+  // time the outer copy can lag. Best-effort; the alignment warning stays as
+  // the fallback when the copy is impossible.
+  if (migrateGlobalLauncher()) {
+    process.stderr.write('dsh-tui: global launcher aligned to the delegating shim (no manual npm i -g needed anymore).\n')
   }
 
   const restartCode = await runProcess(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {

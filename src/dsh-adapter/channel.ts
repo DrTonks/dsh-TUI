@@ -35,24 +35,30 @@ import {
   type SessionSummary,
 } from './sessions/index.js'
 import { writeActivityFrames } from '../activityPrefs.js'
+import { isPathLikeQuery, rankFileCandidates, type FileCandidate } from '../utils/fileSuggestions.js'
 import { readEffortPref, writeEffortPref } from '../effortPrefs.js'
 import { readModelPref, writeModelPref } from '../modelPrefs.js'
 import { explicitModelRoute, recordedModelRoute, resolveModelRoute, validateModelRoute } from '../modelRoute.js'
 import type { ProviderSetupHost } from './providerWizard.js'
 import { readPresetPref, writePresetPref } from '../presetPrefs.js'
-import { composePreset, resolvePersistedPreset, rosterOf, runningPresetOf, serviceForAgent, type AgentPresetInfo } from './presets.js'
-import { isPresetName } from '../components/activityFrames.js'
+import { composePreset, resolvePersistedPreset, resolvePersistedRoute, rosterOf, runningPresetOf, serviceForAgent, type AgentPresetInfo } from './presets.js'
+import { isPresetName, PRESET_NAMES } from '../components/activityFrames.js'
 import { existsSync, statSync, writeFileSync } from 'node:fs'
 import { logForDebugging } from '../utils/debug.js'
 import { homeDir, LEGACY_DATA_DIR } from '../utils/paths.js'
 import { extractMentions } from '../utils/mentions.js'
-import { t } from '../i18n.js'
+import { getLang, LANGS, t } from '../i18n.js'
+import { AUTO_THEME_NAME, THEME_NAMES } from '../theme.js'
+import { listCustomThemes } from '../customTheme.js'
 import { modeDisplayName, resolveSessionModes, type SessionModeSpec } from '../sessionModes.js'
-import { normalizeStatusBar, normalizeToolBackground, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import { normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import { SubagentActivityStore, type SubagentState } from './subagents.js'
+export type { SubagentState } from './subagents.js'
 import type { SpinnerMode } from '../components/Spinner/spinnerMode.js'
 import { ActivityTracker, type ActivityState } from 'dsh-working-activity/status'
 import type { TrackerConfig } from 'dsh-working-activity/status'
 import { featureOn } from 'dsh-working-activity/config'
+import { setMinimalMode } from '../minimalMode.js'
 import { readActivityConfig } from '../activityPrefs.js'
 import { attachSessionToWorkspace } from './workspace.js'
 import { createLocalWorkspaceRuntime, getHostWorkspaceRuntime, type TuiWorkspaceCommand, type TuiWorkspaceCommandResult, type TuiWorkspaceTarget } from './workspaces.js'
@@ -67,7 +73,7 @@ import { installDecisionGuard } from './decision-guard.js'
 import { commandOwner } from './command-attribution.js'
 import { readGrantStore } from './grants.js'
 import { hasCommandErrorCode, mapCommandError } from './command-errors.js'
-import { installedLineOf } from './contract.js'
+import { installedMeetsVersion } from './contract.js'
 import { pluginsInfoLines } from './plugins-info.js'
 import { cleanRenderText, cleanScalarText } from './sanitize.js'
 import type {
@@ -253,6 +259,32 @@ export interface ToolViewPresenter {
   result(name: string, rawArgs: string, data: SessionEvent<'tool/result'>['data']): ToolResultView | undefined
 }
 
+/**
+ * Subagent row: displays a subagent's lifecycle (started → running → completed/failed).
+ * Derived from agent.task events and history events.
+ */
+export interface SubagentControl {
+  interrupt(agentId: string): boolean
+}
+
+export interface SubagentRow {
+  agentId: string
+  runId?: string
+  description: string
+  provider?: string
+  model?: string
+  effort?: string
+  status: SubagentState['status']
+  startedAt: number
+  completedAt?: number
+  durationMs?: number
+  outputLines: string[]
+  toolCalls: SubagentState['toolCalls']
+  tokens?: SubagentState['tokens']
+  summary?: string
+  stopReason?: string
+  error?: string
+}
 
 /**
  * One rendered transcript row. The DSH session log is the source of truth:
@@ -261,7 +293,7 @@ export interface ToolViewPresenter {
  */
 export interface ChatRow {
   id: number
-  kind: 'user' | 'assistant' | 'tool' | 'notice' | 'reasoning' | 'interrupt' | 'local' | 'local-output' | 'compact'
+  kind: 'user' | 'assistant' | 'tool' | 'notice' | 'reasoning' | 'interrupt' | 'local' | 'local-output' | 'compact' | 'subagent'
   /** Extra label for non-human user rows (e.g. `steering`). */
   label?: string
   /** Actual execution location for `!command` rows. */
@@ -271,6 +303,8 @@ export interface ChatRow {
   streaming?: boolean
   /** Present on `tool` rows; the card model. */
   tool?: ToolRow
+  /** Present on `subagent` rows; the subagent state snapshot. */
+  subagent?: SubagentRow
   /** Event wall-clock time (transcript-mode metadata, assistant rows). */
   time?: number
   /** Present on `reasoning` rows once settled: thinking wall-clock duration. */
@@ -311,6 +345,21 @@ export interface NotificationItem {
   /** Auto-dismiss after this many ms (default 4000); 0 = sticky, removed
    *  only through the early-dismiss handle. */
   timeoutMs: number
+}
+
+/** Names the subagent delegation tools ship under (preset `toolName` values
+ *  plus the CLI default); each renders as a live subagent card, never a plain
+ *  tool card. */
+const SUBAGENT_TOOL_NAMES = new Set([
+  'task',
+  'subagent',
+  'subagent_fork',
+  'subagent_claude_code',
+  'subagent_codex',
+  'spawn_task',
+])
+function isSubagentToolName(name: string): boolean {
+  return SUBAGENT_TOOL_NAMES.has(name.toLowerCase())
 }
 
 /**
@@ -476,10 +525,17 @@ export interface Channel {
   readonly thinkingFold: 'preview' | 'full'
   /** Live tool-card background treatment. */
   readonly toolBackground: ToolBackground
+  /** What the fullscreen transcript's right gutter shows (settings
+   *  `dsh-tui.scrollGutter`: turn timeline / proportional scrollbar /
+   *  nothing). */
+  readonly scrollGutter: ScrollGutterMode
   /** Live status-footer visibility and compactness preferences. */
   readonly statusBar: Readonly<StatusBarConfig>
   /** Whether the header's pixel whale art shows (settings `dsh-tui.whale`). */
   readonly whale: boolean
+  /** Minimal mode (settings `dsh-tui.minimal`): no header splash, no emoji
+   *  glyphs, no decorative colors; code highlight and tool colors stay. */
+  readonly minimal: boolean
   /** Whether the in-process working-activity line is shown (config.activity). */
   readonly activityEnabled: boolean
   /** Whether the segmented context bar row shows in the status footer
@@ -487,10 +543,11 @@ export interface Channel {
   readonly contextBarEnabled: boolean
   /**
    * Current same-session goal projection, when a goal exists. Derived live
-   * from the durable `goal/change` context events (round-zero goal-sourced
-   * user messages) in the session log — every goal mutation appends one, so
-   * this snapshot tracks create/edit/pause/resume/complete/block/clear in
-   * real time and replays correctly on resume/rewind.
+   * from the durable goal events in the session log — top-level
+   * `goal/change` snapshots (every goal mutation appends one) plus the
+   * goal-sourced continuation rounds that advance the counter — so this
+   * snapshot tracks create/edit/pause/resume/complete/block/clear in real
+   * time and replays correctly on resume/rewind.
    */
   readonly goal: ChannelGoal | undefined
   /**
@@ -558,6 +615,10 @@ export interface Channel {
     thinking: number
     tools: number
   }
+  /** Active subagents spawned by the current session. */
+  readonly subagents: readonly SubagentState[]
+  /** Native control operations; unavailable providers safely return false. */
+  readonly subagentControl: SubagentControl
   subscribe: (listener: () => void) => () => void
   /** Validate and persist a pasted image, returning its prompt placeholder. */
   stageImage(input: StagedImageInput): Promise<string>
@@ -675,7 +736,9 @@ export interface Channel {
   settingsSections(): readonly TuiSettingsSection[]
   /** Subscribe to settings-section register/unregister events. */
   subscribeSettingsSections(listener: () => void): () => void
-  /** Top-level entries of the session cwd for `@` file completion. */
+  /** Structured `@` file completion, using the session's remote fs service. */
+  listFileCandidates(query: string, options?: { signal?: AbortSignal; topK?: number }): Promise<readonly FileCandidate[]>
+  /** Backward-compatible top-level/recursive listing. */
   listFiles(): Promise<readonly string[]>
   /** Every session the persistence backend stores, classified and unfiltered
    *  — the browser (`/resume`) decides which of them a given view shows. */
@@ -815,6 +878,8 @@ export interface ChannelState {
   thinkingFold: 'preview' | 'full'
   /** Tool-card background treatment (see the public Channel type). */
   toolBackground: ToolBackground
+  /** Transcript gutter mode (see the public Channel type). */
+  scrollGutter: ScrollGutterMode
   /** Status-footer preferences (see the public Channel type). */
   statusBar: StatusBarConfig
   /** Apply a diff-layout change (see the public Channel type). */
@@ -823,12 +888,17 @@ export interface ChannelState {
   setThinkingFold(mode: 'preview' | 'full'): void
   /** Apply a tool-card background change. */
   setToolBackground(background: ToolBackground): void
+  /** Apply a transcript gutter mode change. */
+  setScrollGutter(mode: ScrollGutterMode): void
   /** Apply status-footer preference changes. */
   setStatusBar(config: Partial<StatusBarConfig>): void
   /** Whale header art switch (see the public Channel type). */
   whale: boolean
   /** Apply a whale-visibility change (see the public Channel type). */
   setWhale(visible: boolean): void
+  minimal: boolean
+  /** Apply a minimal-mode change (see the public Channel type). */
+  setMinimal(enabled: boolean): void
   /** Working-activity display switch (see the public Channel type). */
   activityEnabled: boolean
   /** Context bar row switch (see the public Channel type). */
@@ -867,6 +937,9 @@ export interface ChannelState {
     thinking: number
     tools: number
   }
+  /** Active subagents roster (see the public Channel type). */
+  subagents: readonly SubagentState[]
+  subagentControl: SubagentControl
   subscribe: (listener: () => void) => () => void
   stageImage(input: StagedImageInput): Promise<string>
   /** @internal event bump (the public `notify(text)` posts a notification). */
@@ -931,6 +1004,7 @@ export interface ChannelState {
   settingsSections(): readonly TuiSettingsSection[]
   /** Subscribe to settings-section register/unregister events. */
   subscribeSettingsSections(listener: () => void): () => void
+  listFileCandidates(query: string, options?: { signal?: AbortSignal; topK?: number }): Promise<readonly FileCandidate[]>
   listFiles(): Promise<readonly string[]>
   listSessions(): Promise<readonly SessionSummary[]>
   /** Trailing exchanges of a persisted session (see the public Channel type). */
@@ -1130,6 +1204,72 @@ function toolResultText(event: SessionEvent<'tool/result'>): string {
   return block.content.map(item => item.type === 'text' ? item.text : '').join('').trim()
 }
 
+/** Phase badge for the harness goal card — mirrors the panel's PhaseBadge. */
+const GOAL_RESULT_BADGE: Record<string, string> = {
+  active: '● active',
+  paused: '⏸ paused',
+  blocked: '⛔ blocked',
+  complete: '✓ complete',
+}
+
+/**
+ * Summary cards for the harness's goal/todo tools. Their results are machine
+ * JSON (`{"goal":{…}}` / `{"todos":[…]}`) that would otherwise dump under the
+ * tool card as a raw `⎿ {"goal":…}` line. Matched by tool-name substring AND
+ * payload shape, so unrelated tools and plain-text results pass through to
+ * the registry/raw-text path untouched. Runs on the live stream and replay.
+ */
+function harnessToolResultView(
+  name: string,
+  data: SessionEvent<'tool/result'>['data'],
+): ToolResultView | undefined {
+  const lower = name.toLowerCase()
+  const isGoalTool = lower.includes('goal')
+  const isTodoTool = lower.includes('todo')
+  if (!isGoalTool && !isTodoTool) return undefined
+  const block = data.message.content[0]
+  if (block === undefined || block.type !== 'tool-result') return undefined
+  const text = block.content.map(item => item.type === 'text' ? item.text : '').join('').trim()
+  if (text === '' || !text.startsWith('{')) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const record = parsed as Record<string, unknown>
+
+  if (isGoalTool && typeof record.goal === 'object' && record.goal !== null) {
+    const goal = record.goal as Record<string, unknown>
+    if (typeof goal.objective === 'string' && typeof goal.phase === 'string') {
+      const badge = GOAL_RESULT_BADGE[goal.phase] ?? goal.phase
+      const rounds = typeof goal.roundsStarted === 'number' && typeof goal.maxGoalRounds === 'number'
+        ? ` · ${goal.roundsStarted}/${goal.maxGoalRounds}`
+        : ''
+      const activation = typeof record.activation === 'string' ? ` · ${record.activation}` : ''
+      const lines = [`🎯 ${goal.objective}`, `${badge}${rounds}${activation}`]
+      const blocked = (goal.blockedReason as { message?: unknown } | undefined)?.message
+      if (typeof blocked === 'string') lines.push(`⛔ ${blocked}`)
+      return { card: 'generic', content: lines.map(line => ({ type: 'text', text: line })) }
+    }
+  }
+
+  if (isTodoTool && Array.isArray(record.todos)) {
+    const rows = record.todos as Array<Record<string, unknown>>
+    const done = rows.filter(row => row.status === 'completed').length
+    const lines = [`todos ✓ ${done}/${rows.length}`]
+    for (const row of rows) {
+      if (row.status !== 'in_progress' || typeof row.content !== 'string') continue
+      lines.push(`● ${row.content}`)
+      if (lines.length >= 4) break
+    }
+    return { card: 'generic', content: lines.map(line => ({ type: 'text', text: line })) }
+  }
+
+  return undefined
+}
+
 function toolErrorText(event: SessionEvent<'tool/result'>): string {
   const failure = event.data.error
   if (failure === undefined) return ''
@@ -1256,10 +1396,14 @@ export function createChannel(
     thinkingFold?: 'preview' | 'full'
     /** Tool-card background treatment; default `none`. */
     toolBackground?: ToolBackground
+    /** Transcript gutter mode; default `timeline` (settings `dsh-tui.scrollGutter`). */
+    scrollGutter?: ScrollGutterMode
     /** Status-footer field visibility and compactness. */
     statusBar?: Partial<StatusBarConfig>
     /** Show the header's pixel whale art; default on. */
     whale?: boolean
+    /** Minimal mode; default off (settings `dsh-tui.minimal`). */
+    minimal?: boolean
     /** Show the segmented context bar row in the status footer; default on
      *  (cordis.yml `contextBar: false` hides it, issue #29). */
     contextBar?: boolean
@@ -1283,6 +1427,23 @@ export function createChannel(
 ): ChannelState {
   let agent = initialAgent
   let currentHandle: AgentHandle | undefined = options.handle
+  const subagentControl: SubagentControl = {
+    interrupt(agentId) {
+      const child = subagentStore.get(agentId)
+      const target = child?.sessionId ?? agentId
+      const runtime = (ctx as any).subagents
+      if (!runtime?.interrupt || !target) return false
+      try {
+        runtime.interrupt(target, { kind: 'ancestor', agent })
+        subagentStore.onCancelled(agentId, 'interrupted')
+        syncSubagentsNow()
+        state.emit()
+        return true
+      } catch {
+        return false
+      }
+    },
+  }
   // D-7 backstop: the extensions row installs the decision-subscription
   // gate, but the channel IS the dispatch path — a stale patch without that
   // row (or a bare embed mounting neither) would otherwise leave tui/input
@@ -1297,6 +1458,59 @@ export function createChannel(
   const currentGrantStore = (): ReturnType<typeof readGrantStore> =>
     ctx.get('tuiPluginHost')?.grants ?? fallbackGrantStore
   installDecisionGuard(ctx, currentGrantStore())
+  // Subagent activity tracking: collects agent/subagent/*, session/event for
+  // subagents, and exposes live snapshots for the UI.
+  const subagentStore = new SubagentActivityStore()
+  // Subagent ChatRow tracking: maps agentId to its ChatRow for live updates.
+  const subagentRowsByAgentId = new Map<string, ChatRow>()
+  // Task tool descriptions, queued in call order; each subagent/start consumes
+  // the oldest one so the card shows the user-visible task label.
+  const pendingTaskDescriptions: string[] = []
+  
+  /**
+   * Sync subagentStore state into ChatRows (insert/update in state.rows).
+   * Called whenever subagent state changes (spawned/completed/failed/output).
+   * Accepts a caller-taken snapshot to avoid the double copy on the hot path
+   * (session/event fires per subagent token: snapshot here + snapshot in the
+   * caller = two full state copies before emitStream's 16ms throttle).
+   */
+  const syncSubagentRows = (preSnapshot?: readonly SubagentState[]): void => {
+    const snapshot = preSnapshot ?? subagentStore.snapshot()
+    for (const sub of snapshot) {
+      let row = subagentRowsByAgentId.get(sub.agentId)
+      if (!row) {
+        // New subagent: insert a new ChatRow after the last user or assistant message
+        row = {
+          id: nextRowId++,
+          kind: 'subagent',
+          text: sub.description,
+          subagent: undefined, // will be filled below
+        }
+        subagentRowsByAgentId.set(sub.agentId, row)
+        state.rows.push(row)
+      }
+      const subagentRow: SubagentRow = {
+        agentId: sub.agentId,
+        runId: sub.runId,
+        description: sub.description,
+        provider: sub.provider,
+        model: sub.model || 'default',
+        effort: sub.effort,
+        status: sub.status,
+        startedAt: sub.startedAt,
+        completedAt: sub.completedAt,
+        durationMs: sub.completedAt ? sub.completedAt - sub.startedAt : Date.now() - sub.startedAt,
+        outputLines: sub.output.slice(-3),
+        toolCalls: sub.toolCalls,
+        tokens: sub.tokens,
+        summary: sub.summary,
+        stopReason: sub.stopReason,
+        error: sub.error,
+      }
+      row.subagent = subagentRow
+      row.text = sub.description
+    }
+  }
   // The DSH slash-command registry (optional service): /plan, /goal and
   // friends register here; the TUI merges their descriptors into the slash
   // menu and dispatches through `execute` (which logs the paired
@@ -1344,6 +1558,31 @@ export function createChannel(
   const listeners = new Set<() => void>()
   /** True while a frame-aligned stream notification is pending (emitStream). */
   let streamNotifyScheduled = false
+  /** True while subagent assistant/chunk deltas have deferred their
+   *  snapshot+projection to the frame-aligned flush (emitStream's timer).
+   *  Chunks arrive at token rate (100-300 events/s) and the projection is a
+   *  full deep state copy (SubagentActivityStore.snapshot) plus a SubagentRow
+   *  rebuild per tracked agent — running that per token sits BEFORE
+   *  emitStream's 16ms coalescing and defeats it. Non-chunk events
+   *  (tool/call, subagent/end, interrupt) project immediately and clear
+   *  this flag, so lifecycle transitions stay synchronous. */
+  let subagentStreamDirty = false
+  /** Deferred projection for the frame-aligned flush: runs INSIDE the
+   *  emitStream timer, before listeners wake, so React always reads fully
+   *  projected rows. No-op unless a chunk marked the projection dirty. */
+  const flushSubagentStream = (): void => {
+    if (!subagentStreamDirty) return
+    subagentStreamDirty = false
+    state.subagents = subagentStore.snapshot()
+    syncSubagentRows(state.subagents)
+  }
+  /** Immediate projection; supersedes any pending deferred flush (the fresh
+   *  snapshot already contains everything the deferred pass would project). */
+  const syncSubagentsNow = (): void => {
+    subagentStreamDirty = false
+    state.subagents = subagentStore.snapshot()
+    syncSubagentRows(state.subagents)
+  }
   // foldRows incremental cursor (see foldRows): rows only append past the
   // fold line, so each pass touches only newly-eligible rows.
   const foldCursor: { rows: unknown; index: number } = { rows: null, index: 0 }
@@ -1759,12 +1998,13 @@ export function createChannel(
     signal: AbortSignal,
   ) => Promise<CommandExecution | undefined>
 
-  /** Whether the installed command service takes composer images: rc line
-   *  gate with a structural fallback, so a failed manifest probe (bundlers,
-   *  exotic loaders) still lands on the 4-param rc.8 shape at runtime. */
+  /** Whether the installed command service takes composer images: version
+   *  gate (composer images arrived on 0.1.0-rc.8 and every later family —
+   *  0.1.1 included — keeps the 4-param shape) with a structural fallback,
+   *  so a failed manifest probe (bundlers, exotic loaders) still lands on
+   *  the 4-param rc.8 shape at runtime. */
   const commandServiceSupportsImages = (service: CommandRuntime): boolean => {
-    const line = installedLineOf('@deepseek-ai/dsh-commands')
-    if (line !== undefined) return line >= 8
+    if (installedMeetsVersion('@deepseek-ai/dsh-commands', '0.1.0-rc.8')) return true
     return typeof (service.execute as { length?: number } | undefined)?.length === 'number'
       && (service.execute as { length: number }).length >= 4
   }
@@ -2006,6 +2246,74 @@ export function createChannel(
     await applyMode(sessionModes[(index + 1) % sessionModes.length]!)
   }
 
+  // Session-lifetime candidate pool for non-path queries. The load promise is
+  // shared so concurrent first keystrokes cannot kick off duplicate scans, and
+  // it is keyed by cwd so a /workspace switch or resumed session never reuses
+  // another directory's listing.
+  const fileCandidateCache = { cwd: '', load: undefined as Promise<readonly FileCandidate[]> | undefined }
+
+  // `/model <provider/id>` completion: the model catalog is async (one llm
+  // listModels per provider), so the first keystrokes that could be heading
+  // for /model warm a session-lifetime cache — the shared promise dedupes
+  // concurrent triggers, children() synchronously serves whatever has landed,
+  // and the arrival state.emit() reopens the menu mid-typing. switchModel's
+  // success path drops the cache so the [current] tag re-resolves against
+  // the new route.
+  const modelNodeCache = {
+    nodes: undefined as readonly CommandCompletionNode[] | undefined,
+    load: undefined as Promise<void> | undefined,
+  }
+  const warmModelNodes = (): void => {
+    if (modelNodeCache.load !== undefined) return
+    modelNodeCache.load = state.listModels().then((list) => {
+      modelNodeCache.nodes = list.map((model) => ({
+        name: `${model.provider}/${model.id}`,
+        description: model.name,
+        ...(state.provider === model.provider && state.model === model.id
+          ? { tag: 'current' }
+          : {}),
+      }))
+      state.emit()
+    }).catch(() => {
+      // listModels already swallows per-provider failures; this only fires
+      // when the llm service shape itself is missing — settle on an empty
+      // menu rather than retrying on every keystroke.
+      modelNodeCache.nodes = []
+    })
+  }
+
+  // `/preset <id>` completion: same warm-cache pattern as models. The
+  // current/default tags resolve at children() time (sync state reads), so
+  // no cache invalidation is needed on switch.
+  const presetOptionCache = {
+    list: undefined as readonly PresetOption[] | undefined,
+    load: undefined as Promise<void> | undefined,
+  }
+  const warmPresetOptions = (): void => {
+    if (presetOptionCache.load !== undefined) return
+    presetOptionCache.load = state.listPresets().then((list) => {
+      presetOptionCache.list = list
+      state.emit()
+    }).catch(() => {
+      presetOptionCache.list = []
+    })
+  }
+
+  // `/effort <id>` completion: state.effortLevels is the sync vocabulary
+  // (populated on route changes); when still unknown, one best-effort
+  // resolveEfforts warms it. `tried` caps the retry — resolveEfforts
+  // notifies on hard errors, so keystroke-time retries would spam.
+  const effortWarm = { tried: false }
+  const warmEffortLevels = (): void => {
+    if (state.effortLevels !== undefined || effortWarm.tried) return
+    effortWarm.tried = true
+    void resolveEfforts().then((resolved) => {
+      if (resolved === 'unavailable' || resolved === 'error') return
+      effortWarm.tried = false
+      state.emit()
+    }).catch(() => {})
+  }
+
   const state: ChannelState = {
     effortLevels: undefined,
     version: 0,
@@ -2039,8 +2347,10 @@ export function createChannel(
     diffLayout: options.diffLayout ?? 'auto',
     thinkingFold: options.thinkingFold ?? 'preview',
     toolBackground: normalizeToolBackground(options.toolBackground),
+    scrollGutter: normalizeScrollGutter(options.scrollGutter),
     statusBar: normalizeStatusBar(options.statusBar),
     whale: options.whale !== false,
+    minimal: options.minimal === true,
     activityEnabled: options.activity !== false,
     contextBarEnabled: options.contextBar !== false,
     agentPreset: options.agentPreset,
@@ -2050,7 +2360,91 @@ export function createChannel(
     pending: [],
     commandList: LOCAL_COMMANDS,
     commandCompletions(input: string) {
+      // Warm the async vocabularies as soon as the input could be heading
+      // for their commands (`/m`, `/pre`, …) — by the time a trailing space
+      // asks children() for nodes, the fetch has usually landed.
+      const head = input.slice(1).split(/[\t ]/)[0]?.toLowerCase() ?? ''
+      if (head !== '') {
+        if ('model'.startsWith(head)) warmModelNodes()
+        if ('preset'.startsWith(head)) warmPresetOptions()
+        if ('effort'.startsWith(head)) warmEffortLevels()
+      }
       return completeCommands(input, state.commandList, (path) => {
+        if (path.length === 1 && path[0] === 'model') {
+          // provider/id specs, current model tagged; see modelNodeCache.
+          warmModelNodes()
+          return modelNodeCache.nodes ?? []
+        }
+        if (path.length === 1 && path[0] === 'lang') {
+          return [
+            { name: 'status', description: 'Show the current UI language', descriptionKey: 'sugg-status-desc' },
+            ...LANGS.map((lang) => ({
+              name: lang,
+              description: `Switch the UI language to ${lang}`,
+              descriptionKey: lang === 'zh' ? 'sugg-lang-zh-desc' : 'sugg-lang-en-desc',
+              ...(getLang() === lang ? { tag: 'current' } : {}),
+            })),
+          ]
+        }
+        if (path.length === 1 && path[0] === 'theme') {
+          return [
+            { name: 'status', description: 'Show the current theme', descriptionKey: 'sugg-status-desc' },
+            { name: AUTO_THEME_NAME, description: 'Follow the terminal background', descriptionKey: 'sugg-theme-auto-desc' },
+            ...THEME_NAMES.map((name) => ({
+              name,
+              description: `Built-in theme ${name}`,
+              descriptionKey: 'sugg-theme-builtin-desc',
+            })),
+            ...listCustomThemes()
+              .filter((spec) => spec.name !== AUTO_THEME_NAME)
+              .map((spec) => ({
+                name: spec.name,
+                description: `User theme (${spec.base} base)`,
+                descriptionKey: 'sugg-theme-user-desc',
+              })),
+          ]
+        }
+        if (path.length === 1 && path[0] === 'effort') {
+          warmEffortLevels()
+          return [
+            { name: 'status', description: 'Show the current reasoning effort', descriptionKey: 'sugg-status-desc' },
+            ...(state.effortLevels ?? []).map((id) => ({
+              name: id,
+              description: 'Reasoning effort level',
+              descriptionKey: 'sugg-effort-level-desc',
+              ...(state.reasoningEffort === id ? { tag: 'current' } : {}),
+            })),
+          ]
+        }
+        if (path.length === 1 && path[0] === 'preset') {
+          warmPresetOptions()
+          return [
+            { name: 'status', description: 'Show the current agent preset', descriptionKey: 'sugg-status-desc' },
+            ...(presetOptionCache.list ?? []).map((preset) => ({
+              name: preset.id,
+              description: preset.description ?? preset.name ?? preset.id,
+              ...(preset.id === state.agentPreset
+                ? { tag: 'current' }
+                : preset.isDefault
+                  ? { tag: 'default' }
+                  : {}),
+            })),
+          ]
+        }
+        if (path.length === 1 && path[0] === 'activity') {
+          return [
+            { name: 'status', description: 'Show the current activity preset', descriptionKey: 'sugg-status-desc' },
+            { name: 'frames', description: 'List or switch frame presets', descriptionKey: 'sugg-activity-frames-desc' },
+          ]
+        }
+        if (path.length === 2 && path[0] === 'activity' && path[1] === 'frames') {
+          return PRESET_NAMES.map((name) => ({
+            name,
+            description: 'Animation frame preset',
+            descriptionKey: 'sugg-activity-frame-desc',
+            ...(state.activityFrames === name ? { tag: 'current' } : {}),
+          }))
+        }
         if (path.length === 1 && path[0] === 'workspace') {
           const builtins: CommandCompletionNode[] = [
             { name: 'resume', description: 'Switch to another workspace', descriptionKey: 'cmd-desc-workspace-resume' },
@@ -2069,6 +2463,21 @@ export function createChannel(
               })),
           ]
         }
+        if (path.length === 1 && path[0] === 'permission') {
+          // Sandbox-preset vocabulary of the `/permission` picker — Tab
+          // completes it for keyboard users, Enter still dispatches.
+          return [
+            { name: 'read-only', description: 'Read-only session: no file writes, no commands', descriptionKey: 'permission-preset-readonly-desc' },
+            { name: 'workspace-write', description: 'Read/write inside the workspace; writes need a prior read', descriptionKey: 'permission-preset-workspace-write-desc' },
+            { name: 'danger-full-access', description: 'Unrestricted access, no approvals', descriptionKey: 'permission-preset-full-access-desc' },
+          ]
+        }
+        if (path.length === 1 && path[0] === 'plan') {
+          return [
+            { name: 'on', description: 'Enter plan mode: read-only, plan before acting', descriptionKey: 'plan-mode-on-desc' },
+            { name: 'off', description: 'Exit plan mode, back to normal execution', descriptionKey: 'plan-mode-off-desc' },
+          ]
+        }
         return commandTrees?.children(path) ?? []
       })
     },
@@ -2082,6 +2491,8 @@ export function createChannel(
       thinking: 0,
       tools: 0,
     },
+    subagents: [],
+    subagentControl,
     subscribe(listener) {
       listeners.add(listener)
       return () => {
@@ -2105,6 +2516,9 @@ export function createChannel(
       streamNotifyScheduled = true
       const timer = setTimeout(() => {
         streamNotifyScheduled = false
+        // Deferred subagent projection rides this same frame: flush BEFORE
+        // the listeners wake so React reads fully projected rows.
+        flushSubagentStream()
         foldRows(state.rows, MAX_ROWS, foldCursor)
         for (const listener of listeners) listener()
       }, 16)
@@ -2507,10 +2921,20 @@ export function createChannel(
         provider: options.configuredProvider,
         model: options.configuredModel,
       })
+      // The recorded route feeds back into agentOptions too — not just the
+      // status line below: a provider-only cordis.yml pin (issue #67) leaves
+      // agentOptions.model undefined on resume, which breaks the `{{model}}`
+      // persona variable for the resumed agent's own assembly AND for every
+      // subagent it spawns (dsh-subagent's resolveChildAgentOptions inherits
+      // `parent.options.model`).
+      const recordedRoute = await resolvePersistedRoute(ctx, SessionId(sessionId))
       try {
         handle = await agents.resume({
           resumeSessionId: SessionId(sessionId),
-          agentOptions: { provider: resumeRoute?.provider, model: resumeRoute?.model },
+          agentOptions: {
+            provider: resumeRoute?.provider ?? recordedRoute?.provider,
+            model: resumeRoute?.model ?? recordedRoute?.model,
+          },
           ...(resumeComposed.setup === undefined ? {} : { setup: resumeComposed.setup }),
         })
       } catch (error) {
@@ -2926,6 +3350,11 @@ export function createChannel(
       state.agentPreset = modelComposed.agentPreset
       state.model = model
       state.provider = provider
+      // /model completion cache: the [current] tag was resolved at fetch
+      // time — drop the cache so the next `/model ` refetches for the new
+      // route.
+      modelNodeCache.nodes = undefined
+      modelNodeCache.load = undefined
       state.tps = undefined
       state.tpsSamples = []
       state.lastUsage = undefined
@@ -3032,6 +3461,12 @@ export function createChannel(
       state.toolBackground = normalized
       state.emit()
     },
+    setScrollGutter(mode) {
+      const normalized = normalizeScrollGutter(mode)
+      if (normalized === state.scrollGutter) return
+      state.scrollGutter = normalized
+      state.emit()
+    },
     setStatusBar(config) {
       const next = normalizeStatusBar({ ...state.statusBar, ...config })
       const changed = Object.keys(next).some(key =>
@@ -3044,6 +3479,12 @@ export function createChannel(
     setWhale(visible) {
       if (visible === state.whale) return
       state.whale = visible
+      state.emit()
+    },
+    setMinimal(enabled) {
+      setMinimalMode(enabled)
+      if (enabled === state.minimal) return
+      state.minimal = enabled
       state.emit()
     },
     setActivityFrames(name) {
@@ -3391,20 +3832,30 @@ export function createChannel(
         signal: options?.signal,
       })
     },
-    listFiles() {
-      const fs = ctx.get('fs') as
-        | {
-          resolve(path: string): Promise<{ displayPath: string }>
-          listDir(target: { displayPath: string }): Promise<
-            Array<{
-              name: string
-              type: 'file' | 'directory' | 'other'
-              target: { displayPath: string }
-            }>
-          >
-        }
-        | undefined
-      return listFilesDeep(fs, state.cwd)
+    async listFileCandidates(query: string, options?: { signal?: AbortSignal; topK?: number }) {
+      const fs = ctx.get('fs') as MentionFs | undefined
+      if (!fs || options?.signal?.aborted) return []
+      if (isPathLikeQuery(query)) {
+        return listPathCandidates(fs, state.cwd, query, options?.signal, options?.topK ?? 50)
+      }
+      if (fileCandidateCache.cwd !== state.cwd) {
+        fileCandidateCache.cwd = state.cwd
+        fileCandidateCache.load = undefined
+      }
+      fileCandidateCache.load ??= listFilesDeepCandidates(fs, state.cwd).then(candidates => {
+        if (candidates.length > 0) return candidates
+        // An empty scan is not worth caching forever — retry on next query.
+        fileCandidateCache.load = undefined
+        return candidates
+      })
+      const candidates = await fileCandidateCache.load
+      if (options?.signal?.aborted) return []
+      return rankFileCandidates(candidates, query, options?.topK ?? 50)
+    },
+    async listFiles() {
+      const fs = ctx.get('fs') as MentionFs | undefined
+      const candidates = await listFilesDeepCandidates(fs, state.cwd)
+      return candidates.map(candidate => candidate.path)
     },
     async listSessions() {
       // Every stored session, classified and unfiltered. Which of them a
@@ -4298,6 +4749,11 @@ ${output}
    *  its result-time contextual diff back from here). */
   const presentResultView = (name: string, rawArgs: string, data: SessionEvent<'tool/result'>['data']): ToolResultView | undefined => {
     try {
+      // Harness goal/todo tools first: their raw JSON reads as noise in the
+      // transcript — fold recognizable shapes into a summary card before the
+      // registry gets a chance to (not) know them.
+      const local = harnessToolResultView(name, data)
+      if (local !== undefined) return local
       const tool = toolsRegistry?.get(name, agent)
       if (tool?.presentResult === undefined) return undefined
       const block = data.message.content[0]
@@ -4433,28 +4889,49 @@ ${output}
   }
 
   /**
+   * One durable goal mutation as the goal service records it (the `data` of
+   * a top-level `goal/change` session event, and of the snapshot a round-zero
+   * goal-sourced `user/message` may inline). Declared structurally: the
+   * pinned peer's `SessionEvent` union predates the event type, so the fold
+   * admits the payload by shape, not by union membership.
+   */
+  type GoalChangePayload = {
+    kind: 'goal/change'
+    version: number
+    operation:
+      | 'create'
+      | 'edit'
+      | 'pause'
+      | 'resume'
+      | 'complete'
+      | 'block'
+      | 'clear'
+    goal?: Omit<ChannelGoal, 'roundsStarted'>
+    roundsStarted?: number
+  }
+
+  /** Fold one goal mutation into the channel's goal projection. */
+  const applyGoalChange = (change: GoalChangePayload): void => {
+    if (change.operation === 'clear') {
+      state.goal = undefined
+    } else if (change.goal !== undefined) {
+      state.goal = {
+        ...change.goal,
+        roundsStarted: change.roundsStarted ?? state.goal?.roundsStarted ?? 0,
+      }
+    }
+  }
+
+  /**
    * Fold one goal-sourced message into the channel's goal projection.
-   * Round-zero goal messages carry the full durable snapshot (or a clear
+   * Round-zero goal messages may carry the full durable snapshot (or a clear
    * tombstone) in their source; positive-round messages are admitted
    * continuation prompts that only advance the rounds counter.
    */
   const applyGoalEvent = (event: SessionEvent<'user/message'>): void => {
     const source = event.data.source as unknown as {
       round: number
-      change?: {
-        kind: 'goal/change'
-        version: 1
-        operation:
-          | 'create'
-          | 'edit'
-          | 'pause'
-          | 'resume'
-          | 'complete'
-          | 'block'
-          | 'clear'
-        goal?: ChannelGoal
-        roundsStarted?: number
-      }
+      change?: GoalChangePayload
     }
     if (source.round > 0) {
       // Admitted continuation round — the snapshot itself is unchanged.
@@ -4469,14 +4946,7 @@ ${output}
     const change = source.change
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- durable replay data may not match the static type
     if (change === undefined || change.kind !== 'goal/change') return
-    if (change.operation === 'clear') {
-      state.goal = undefined
-    } else if (change.goal !== undefined) {
-      state.goal = {
-        ...change.goal,
-        roundsStarted: change.roundsStarted ?? state.goal?.roundsStarted ?? 0,
-      }
-    }
+    applyGoalChange(change)
   }
 
   /** True while the durable transcript is being replayed (boot /resume /
@@ -4504,6 +4974,15 @@ ${output}
   }
 
   const renderEvent = (event: SessionEvent): void => {
+    // Top-level `goal/change` events are how the goal service actually
+    // records durable goal mutations (create/edit/pause/resume/complete/
+    // block/clear) — confirmed in production logs. The pinned peer's
+    // SessionEvent union predates the type, so admit it structurally: the
+    // goal chip and panel stay dark without this fold.
+    if ((event as { type: string }).type === 'goal/change') {
+      applyGoalChange((event as { data: GoalChangePayload }).data)
+      return
+    }
     switch (event.type) {
       case 'user/message': {
         // Compaction checkpoint: `source = { kind: 'plugin', plugin:
@@ -4549,10 +5028,13 @@ ${output}
           contextWarned = false
           break
         }
-        // Same-session goal domain: round-zero goal-sourced messages carry
-        // the durable goal snapshot (or clear tombstone) in their source.
-        // They are not transcript bubbles — they drive the goal panel's
-        // live projection (replayed on resume/rewind like every other event).
+        // Same-session goal domain: goal-sourced messages are the round
+        // driver's continuation prompts (positive rounds advance the
+        // counter); some hosts also inline the durable snapshot in a
+        // round-zero source. They are not transcript bubbles — they drive
+        // the goal panel's live projection (replayed on resume/rewind like
+        // every other event; the snapshot itself arrives as the top-level
+        // `goal/change` event admitted above).
         if ((event.data.source as { kind: string }).kind === 'goal') {
           applyGoalEvent(event)
           break
@@ -4760,6 +5242,20 @@ ${output}
         // by the TUI once the batch is answered; tool/result for a call with
         // no card is a no-op below.
         if (event.data.name === 'ask_user_question') break
+        // The Task tool's plain card is replaced by the live subagent card
+        // (Kimi Code semantics): the delegation itself renders as a subagent
+        // row, so the raw args/result card would only duplicate it. The call
+        // still runs - only its transcript rendering is suppressed.
+        if (isSubagentToolName(event.data.name)) {
+          try {
+            const args = JSON.parse(event.data.arguments) as { description?: unknown }
+            if (typeof args.description === 'string' && args.description) pendingTaskDescriptions.push(args.description)
+          } catch {
+            // Unparseable args leave the queue untouched; the card falls back
+            // to the provider label.
+          }
+          break
+        }
         // Reasoning that led to a tool call is done thinking — fold the
         // preview now, before the tool card grows the transcript past it
         // (see foldLiveReasoning).
@@ -5121,6 +5617,24 @@ ${output}
         }
       })(),
       ctx.on('session/event', (session, event) => {
+        // First check if this is a subagent session
+        const subagentId = subagentStore.getSubagentIdBySession(session)
+        if (subagentId) {
+          subagentStore.onSessionEvent(subagentId, event)
+          if (event.type === 'assistant/chunk') {
+            // Token-rate path (100-300 events/s): the store append stays
+            // synchronous (cheap); the expensive snapshot + row projection
+            // defers to the frame-aligned flush inside emitStream's 16ms
+            // timer, so it coalesces exactly like the main-agent stream.
+            subagentStreamDirty = true
+            state.emitStream()
+          } else {
+            syncSubagentsNow()
+            state.emit()
+          }
+          return
+        }
+        // Otherwise handle main agent session
         if (session !== agent.session) return
         // Observation broker (C-042): maps user/message + assistant/message
         // into grant-gated envelopes; every other event type is a no-op, and
@@ -5148,6 +5662,60 @@ ${output}
         if (event.type === 'assistant/chunk') state.emitStream()
         else state.emit()
       }),
+      // Subagent lifecycle tracking. The dsh-subagent service publishes scoped
+      // observe-only events as `subagent/start` and `subagent/end`; the parent
+      // Agent is carried by Cordis scope dispatch, not included in the payload.
+      (() => {
+        const disposeStart = ctx.on('subagent/start' as any, (info: { id: string; runId?: string; provider: string; local?: boolean }) => {
+          if (!info?.id) return
+          subagentStore.onSpawned(info.id, info.provider || 'subagent', info.provider, {
+            runId: info.runId ?? info.id,
+            local: info.local,
+            description: pendingTaskDescriptions.shift() ?? `${info.provider || 'subagent'} task`,
+          })
+          // In-process providers publish a child Agent during this notification.
+          // Resolve through ctx.get('agents') (the property proxy is
+          // topology-sensitive); the child carries its session (live output
+          // stream) and its provider/model route for the card header.
+          try {
+            const agents = ctx.get('agents') as
+              | { get(id: string): { session?: unknown; options?: { provider?: string; model?: string } } | undefined }
+              | undefined
+            const child = agents?.get(info.id)
+            if (child?.session) {
+              subagentStore.linkSession(info.id, child.session)
+              const model = child.options?.model ?? child.options?.provider
+              if (model) subagentStore.patch(info.id, { model, provider: child.options?.provider ?? info.provider })
+            }
+          } catch {
+            // Session discovery is best-effort and must not break the parent turn.
+          }
+          syncSubagentsNow()
+          state.emit()
+        })
+        const disposeEnd = ctx.on('subagent/end' as any, (info: { id: string; stopReason: string; lastAssistantMessage?: unknown[] }) => {
+          if (!info?.id) return
+          const output = Array.isArray(info.lastAssistantMessage)
+            ? info.lastAssistantMessage
+                .map(block => typeof block === 'object' && block !== null && 'text' in block ? String((block as { text?: unknown }).text ?? '') : '')
+                .filter(Boolean)
+                .join('\n')
+            : ''
+          // The final assistant output becomes the card's summary only; the
+          // running waterfall came from the child session stream, so echoing
+          // it into the output buffer would duplicate it on the collapsed card.
+          subagentStore.flushOutput(info.id)
+          if (info.stopReason === 'completed') subagentStore.onCompleted(info.id, output, info.stopReason)
+          else if (info.stopReason === 'cancelled' || info.stopReason === 'aborted') subagentStore.onCancelled(info.id, info.stopReason, output)
+          else subagentStore.onFailed(info.id, info.stopReason || 'Unknown error')
+          syncSubagentsNow()
+          state.emit()
+        })
+        return () => {
+          disposeStart()
+          disposeEnd()
+        }
+      })(),
     ]
   }
   // Subagents inherit provider/model from AgentOptions, but resumed TUI
@@ -5310,82 +5878,89 @@ function usageOutputTokens(usage: unknown): number | undefined {
     : undefined
 }
 
-/**
- * `@` file listing through the leaf's fs service (dsh-fs-local): skips
- * VCS/dependency/build dirs and rotates across directory listings so one
- * large subtree cannot consume the global MAX_FILES budget. That budget also
- * bounds directory reads without imposing an arbitrary source-tree depth.
- * Relative directories retain the trailing `/` that FileSuggestions expects.
- * Unreadable subtrees are skipped, not fatal.
- */
-async function listFilesDeep(
-  fs: {
-    resolve(path: string): Promise<{ displayPath: string }>
-    listDir(target: { displayPath: string }): Promise<
-      Array<{
-        name: string
-        type: 'file' | 'directory' | 'other'
-        target: { displayPath: string }
-      }>
-    >
-  } | undefined,
-  root: string,
-): Promise<string[]> {
+type FileSuggestionFs = {
+  resolve(path: string): Promise<{ displayPath: string }>
+  listDir(target: { displayPath: string }): Promise<Array<{ name: string; type: 'file' | 'directory' | 'other'; target?: { displayPath: string } }>>
+}
+
+async function listPathCandidates(fs: FileSuggestionFs, cwd: string, query: string, signal: AbortSignal | undefined, topK: number): Promise<FileCandidate[]> {
+  const normalized = query.replaceAll('\\', '/')
+  const slash = normalized.lastIndexOf('/')
+  // `.` / `..` without a trailing separator are whole-directory queries too.
+  const bareDir = slash < 0 && (normalized === '.' || normalized === '..' || normalized === '~')
+  const directoryPart = slash < 0 ? (bareDir ? `${normalized}/` : '') : normalized.slice(0, slash + 1)
+  const nameQuery = slash < 0 || bareDir ? '' : normalized.slice(slash + 1)
+  // `~/` expands against the host home (matches the cwd resolution rules);
+  // drive-letter and POSIX-absolute prefixes pass through untouched.
+  const expanded = directoryPart === '~/'
+    ? `${homeDir()}/`
+    : directoryPart.startsWith('/') || /^[A-Za-z]:\//.test(directoryPart)
+      ? directoryPart
+      : join(cwd, directoryPart || '.')
+  try {
+    if (signal?.aborted) return []
+    const target = await fs.resolve(expanded)
+    const entries = (await fs.listDir(target)).slice().sort((a, b) => a.name.localeCompare(b.name))
+    return rankFileCandidates(entries.filter(entry => entry.type === 'file' || entry.type === 'directory').map(entry => {
+      const path = `${directoryPart}${entry.name}${entry.type === 'directory' ? '/' : ''}`
+      return { id: path, path, displayPath: path, name: entry.name, kind: entry.type as 'file' | 'directory', score: 0 }
+    }), nameQuery, topK)
+  } catch {
+    return []
+  }
+}
+
+async function listFilesDeepCandidates(fs: FileSuggestionFs | undefined, root: string, signal?: AbortSignal): Promise<FileCandidate[]> {
   if (!fs) return []
-  const out: string[] = []
+  const out: FileCandidate[] = []
   const SKIP = new Set(['node_modules', '.git', '.hg', '.svn', '.DS_Store', 'dist'])
   const BUILD_DIR = /^(?:build(?:[-_].*)?|cmake-build(?:[-_].*)?)$/i
-  const MAX_FILES = 100
-
-  type Entry = {
-    name: string
-    type: 'file' | 'directory' | 'other'
-    target: { displayPath: string }
-  }
-  type Directory = {
-    dir: string
-    prefix: string
-    entries?: Entry[]
-    index: number
-  }
-  const directories: Directory[] = [{ dir: root, prefix: '', index: 0 }]
-
-  while (directories.length > 0 && out.length < MAX_FILES) {
-    const current = directories.shift()
-    if (!current) continue
+  type Entry = { name: string; type: 'file' | 'directory' | 'other'; target?: { displayPath: string } }
+  type Node = { dir: string; prefix: string; entries?: Entry[]; index: number }
+  const queue: Node[] = [{ dir: root, prefix: '', index: 0 }]
+  const visited = new Set<string>()
+  const maxFiles = 100
+  const maxDirectories = 100
+  let fileCount = 0
+  let dirCount = 0
+  // Round-robin: each directory yields ONE non-skipped entry per visit before
+  // it re-queues, so a large early sibling (e.g. `generated/` with 120 files)
+  // cannot starve `src/` out of the per-kind budgets. This is the regression
+  // contract pinned by scripts/verify-file-completion.mjs.
+  while (queue.length && fileCount < maxFiles && dirCount < maxDirectories) {
+    if (signal?.aborted) return []
+    const current = queue.shift()!
     if (!current.entries) {
       try {
         const target = await fs.resolve(current.dir)
-        current.entries = await fs.listDir(target)
-      } catch {
-        continue // unreadable subtree — skip
-      }
+        if (visited.has(target.displayPath)) continue
+        visited.add(target.displayPath)
+        current.entries = (await fs.listDir(target)).slice().sort((a, b) => a.name.localeCompare(b.name))
+      } catch { continue }
     }
-
     let entry: Entry | undefined
     while (current.index < current.entries.length) {
-      const candidate = current.entries[current.index++]
+      const candidate = current.entries[current.index++]!
       if (SKIP.has(candidate.name) || BUILD_DIR.test(candidate.name)) continue
       entry = candidate
       break
     }
     if (!entry) continue
-    if (current.index < current.entries.length) directories.push(current)
+    if (current.index < current.entries.length) queue.push(current)
 
-    const rel = current.prefix ? `${current.prefix}/${entry.name}` : entry.name
+    const path = current.prefix ? `${current.prefix}/${entry.name}` : entry.name
     if (entry.type === 'directory') {
-      out.push(`${rel}/`)
-      directories.push({
-        // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: symlink targets optional
-        dir: entry.target?.displayPath ?? join(current.dir, entry.name),
-        prefix: rel,
-        index: 0,
-      })
+      if (dirCount >= maxDirectories) continue
+      out.push({ id: `${path}/`, path: `${path}/`, displayPath: `${path}/`, name: entry.name, kind: 'directory', score: 0 })
+      dirCount += 1
+      queue.push({ dir: entry.target?.displayPath ?? join(current.dir, entry.name), prefix: path, index: 0 })
     } else if (entry.type === 'file') {
-      out.push(rel)
+      if (fileCount >= maxFiles) continue
+      out.push({ id: path, path, displayPath: path, name: entry.name, kind: 'file', score: 0 })
+      fileCount += 1
     }
   }
-  return out
+  return out.sort((a, b) => a.path.localeCompare(b.path))
 }
 
 /** One attached file's contribution is capped so an absent-minded `@` of a
