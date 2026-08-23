@@ -30,7 +30,7 @@ import { optimize } from './optimizer.js';
 import Output from './output.js';
 import type { ParsedKey } from './parse-keypress.js';
 import reconciler, { dispatcher, getLastCommitMs, getLastYogaMs, isDebugRepaintsEnabled, recordYogaMs, resetProfileCounters } from './reconciler.js';
-import renderNodeToOutput, { consumeFollowScroll, createRenderContext } from './render-node-to-output.js';
+import renderNodeToOutput, { createRenderContext } from './render-node-to-output.js';
 import { applyPositionedHighlight, type MatchPosition, scanPositions } from './render-to-screen.js';
 import createRenderer, { type Renderer } from './renderer.js';
 import { CellWidth, CharPool, cellAt, createScreen, HyperlinkPool, isEmptyCellAt, migrateScreenPools, StylePool } from './screen.js';
@@ -654,7 +654,7 @@ export default class Ink {
     // mouse as the anchor walks up. After release, both ends are text-
     // anchored and move as a block.
     const follow = pickFollowForSelection(
-      consumeFollowScroll(),
+      frame.followScrolls ?? [],
       this.selection.anchor?.row ?? null,
     );
     // pickFollowForSelection already checked anchor-in-viewport (that IS
@@ -1678,7 +1678,14 @@ export default class Ink {
       return false;
     }
     const blank = isEmptyCellAt(this.frontFrame.screen, col, row);
-    const handled = dispatchClick(this.rootNode, col, row, blank, button);
+    const handled = dispatchClick(
+      this.rootNode,
+      col,
+      row,
+      blank,
+      button,
+      this.frontFrame.absoluteHitList ?? [],
+    );
     logMouseDebug('dispatchClick', { col, row, handled });
     return handled;
   }
@@ -1698,7 +1705,15 @@ export default class Ink {
   ): boolean {
     this.probeAltScreenHealth();
     if (!this.altScreenActive) return false;
-    const handled = dispatchWheel(this.rootNode, col, row, deltaY, deltaX, button);
+    const handled = dispatchWheel(
+      this.rootNode,
+      col,
+      row,
+      deltaY,
+      deltaX,
+      button,
+      this.frontFrame.absoluteHitList ?? [],
+    );
     if (handled) {
       logMouseDebug('dispatchWheelAt consumed', { col, row, deltaY, deltaX });
     }
@@ -1707,7 +1722,13 @@ export default class Ink {
   dispatchHover(col: number, row: number): void {
     this.probeAltScreenHealth();
     if (!this.altScreenActive) return;
-    dispatchHover(this.rootNode, col, row, this.hoveredNodes);
+    dispatchHover(
+      this.rootNode,
+      col,
+      row,
+      this.hoveredNodes,
+      this.frontFrame.absoluteHitList ?? [],
+    );
   }
   dispatchKeyboardEvent(parsedKey: ParsedKey): void {
     this.probeAltScreenHealth();

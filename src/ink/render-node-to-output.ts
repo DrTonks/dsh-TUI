@@ -39,7 +39,10 @@ export type RenderContext = {
   recomposePass: boolean
   scrollHint: ScrollHint | null
   scrollDrainNode: DOMElement | null
-  followScroll: FollowScroll | null
+  /** Absolute nodes painted by this renderer invocation, in paint order. */
+  absoluteHitList: AbsoluteHitEntry[]
+  /** Scroll events produced by this renderer invocation. */
+  followScrolls: FollowScroll[]
   /** First-pass visual scroll positions reused by the paint-only pass. */
   scrollPaintTops: WeakMap<DOMElement, number>
   absoluteRectsPrev: Rectangle[]
@@ -74,7 +77,8 @@ export function createRenderContext(
     recomposePass: false,
     scrollHint: null,
     scrollDrainNode: null,
-    followScroll: null,
+    absoluteHitList: [],
+    followScrolls: [],
     scrollPaintTops: new WeakMap(),
     absoluteRectsPrev,
     absoluteRectsCur,
@@ -96,15 +100,6 @@ export function createRenderContext(
  * moved up (scrollTop increased, CSI n S).
  */
 export type ScrollHint = { top: number; bottom: number; delta: number }
-let scrollHint: ScrollHint | null = null
-
-// Rects of position:absolute nodes from the PREVIOUS frame, used by
-// ScrollBox's blit+shift third-pass repair (see usage site). Recorded at
-// three paths — full-render nodeCache.set, node-level blit early-return,
-// blitEscapingAbsoluteDescendants — so clean-overlay consecutive scrolls
-// still have the rect.
-let absoluteRectsPrev: Rectangle[] = []
-let absoluteRectsCur: Rectangle[] = []
 
 // position:absolute nodes of the CURRENT frame with their paint rects, for
 // pointer hit-testing. hitTest's containment recursion cannot reach an
@@ -114,23 +109,6 @@ let absoluteRectsCur: Rectangle[] = []
 // skipped and the overlay's handlers are unreachable). Dispatchers consult
 // this list first, in reverse paint order (later = visually on top).
 export type AbsoluteHitEntry = { node: DOMElement; rect: Rectangle }
-let absoluteHitList: AbsoluteHitEntry[] = []
-
-/**
- * The current frame's absolute-positioned nodes in paint order.
- * @returns read-only list; reverse-iterate for topmost-first hit-testing.
- */
-export function getAbsoluteHitList(): readonly AbsoluteHitEntry[] {
-  return absoluteHitList
-}
-
-/** Reset the scroll hint for the next frame and rotate the absolute-rect buffers. */
-export function resetScrollHint(): void {
-  scrollHint = null
-  absoluteRectsPrev = absoluteRectsCur
-  absoluteRectsCur = []
-  absoluteHitList = []
-}
 
 /**
  * Discard first-pass bookkeeping before an absolute-layout recomposition.
@@ -143,6 +121,7 @@ export function resetAbsoluteRecomposePass(context: RenderContext): void {
   context.recomposePass = true
   context.scrollHint = null
   context.absoluteRectsCur.length = 0
+  context.absoluteHitList.length = 0
 }
 
 // At-bottom follow scroll event this frame. When streaming content
@@ -168,26 +147,6 @@ export type FollowScroll = {
   delta: number
   viewportTop: number
   viewportBottom: number
-}
-let followScrolls: FollowScroll[] = []
-
-/**
- * Read and clear the follow-scroll events recorded this frame. At most one
- * per ScrollBox (a box that follows AND drains reports only the follow —
- * the follow branch clears pendingScrollDelta before the drain runs);
- * several boxes may each report when they scroll in the same frame.
- * @returns this frame's follow-scroll events; empty when none.
- */
-export function consumeFollowScroll(): FollowScroll[] {
-  const f = followScrolls
-  followScrolls = []
-  return f
-}
-
-/** Clear per-frame compatibility state used by hit-testing and selection. */
-export function resetRenderTransients(): void {
-  absoluteHitList = []
-  followScrolls = []
 }
 
 // ── Native terminal drain (iTerm2/Ghostty/etc. — proportional events) ──
@@ -599,7 +558,7 @@ function renderNodeToOutput(
       if (node.style.position === 'absolute') {
         context.absoluteRectsCur.push(cached)
         context.absoluteNodesCur.add(node)
-        absoluteHitList.push({ node, rect: cached })
+        context.absoluteHitList.push({ node, rect: cached })
       }
       // Absolute descendants can paint outside this node's layout bounds
       // (e.g. a slash menu with position='absolute' bottom='100%' floats
@@ -1000,16 +959,11 @@ function renderNodeToOutput(
         const followDelta = (node.scrollTop ?? 0) - scrollTopBeforeFollow
         if (!context.recomposePass && followDelta > 0) {
           const vpTop = node.scrollViewportTop ?? 0
-          followScrolls.push({
+          context.followScrolls.push({
             delta: followDelta,
             viewportTop: vpTop,
             viewportBottom: vpTop + innerHeight - 1,
           })
-          context.followScroll = {
-            delta: followDelta,
-            viewportTop: vpTop,
-            viewportBottom: vpTop + innerHeight - 1,
-          }
         }
         // Drain pendingScrollDelta. Native terminals (proportional burst
         // events) use proportional drain; xterm.js (VS Code, sparse events +
@@ -1136,7 +1090,7 @@ function renderNodeToOutput(
         const wheelDelta = scrollTop - scrollTopBeforeFollow - followDelta
         if (!context.recomposePass && wheelDelta !== 0) {
           const wheelVpTop = node.scrollViewportTop ?? 0
-          followScrolls.push({
+          context.followScrolls.push({
             delta: wheelDelta,
             viewportTop: wheelVpTop,
             viewportBottom: wheelVpTop + innerHeight - 1
@@ -1554,7 +1508,7 @@ function renderNodeToOutput(
     if (node.style.position === 'absolute') {
       context.absoluteRectsCur.push(rect)
       context.absoluteNodesCur.add(node)
-      absoluteHitList.push({ node, rect })
+      context.absoluteHitList.push({ node, rect })
     }
     node.dirty = false
   }
@@ -1690,7 +1644,7 @@ function blitEscapingAbsoluteDescendants(
       if (cached) {
         context.absoluteRectsCur.push(cached)
         context.absoluteNodesCur.add(elem)
-        absoluteHitList.push({ node: elem, rect: cached })
+        context.absoluteHitList.push({ node: elem, rect: cached })
         const cx = Math.floor(cached.x)
         const cy = Math.floor(cached.y)
         const cw = Math.floor(cached.width)

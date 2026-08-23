@@ -774,7 +774,7 @@ export type ScrollEvent = {
  * @returns the event the selection should be translated by, or null.
  */
 export function pickFollowForSelection(
-  events: ScrollEvent[],
+  events: readonly ScrollEvent[],
   anchorRow: number | null,
 ): ScrollEvent | null {
   if (anchorRow === null) return null

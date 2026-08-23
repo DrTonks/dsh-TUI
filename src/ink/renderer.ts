@@ -7,7 +7,6 @@ import renderNodeToOutput, {
   createRenderContext,
   createRendererState,
   resetAbsoluteRecomposePass,
-  resetRenderTransients,
 } from './render-node-to-output.js'
 import { createScreen, type StylePool } from './screen.js'
 
@@ -122,7 +121,6 @@ export default function createRenderer(
     }
 
     const renderContext = createRenderContext(rendererState)
-    resetRenderTransients()
 
     // prevFrameContaminated: selection overlay mutated the returned screen
     // buffer post-render (in ink.tsx), resetFramesForAltScreen() replaced it
@@ -172,7 +170,8 @@ export default function createRenderer(
       layoutShifted: renderContext.layoutShifted,
       scrollHint: options.altScreen ? renderContext.scrollHint : null,
       scrollDrainPending: drainNode !== null,
-      followScroll: renderContext.followScroll,
+      absoluteHitList: renderContext.absoluteHitList,
+      followScrolls: renderContext.followScrolls,
       screen: renderedScreen,
       viewport: {
         width: terminalWidth,

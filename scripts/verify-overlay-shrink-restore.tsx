@@ -13,9 +13,10 @@ const [
   { PassThrough, Writable },
   React,
   { Terminal: XTerm },
-  { render, Box, Text, ScrollBox },
+  { render, AlternateScreen, Box, Text, ScrollBox },
   { OverlayAbove },
   { createRenderContext, resetAbsoluteRecomposePass },
+  { dispatchClick: dispatchHitClick },
 ] = await Promise.all([
     import('node:stream'),
     import('react'),
@@ -23,6 +24,7 @@ const [
     import('../src/ui.js'),
     import('../src/components/OverlayAbove.js'),
     import('../src/ink/render-node-to-output.js'),
+    import('../src/ink/hit-test.js'),
   ])
 const { default: inkInstances } = await import('../src/ink/instances.js')
 
@@ -262,10 +264,12 @@ function IsolationFixture({
   label,
   rows,
   scrollRef,
+  onOverlayClick,
 }: {
   label: string
   rows: number
   scrollRef: React.RefObject<TestScrollHandle | null>
+  onOverlayClick?: () => void
 }): React.ReactNode {
   return (
     <Box flexDirection="column" width={COLS} height={ROWS}>
@@ -277,13 +281,20 @@ function IsolationFixture({
         ))}
       </ScrollBox>
       <Box height={3} width="100%">
-        <OverlayAbove>
-          <Box flexDirection="column">
-            {Array.from({ length: rows }, (_, index) => (
-              <Text key={index}>{`${label}-OVERLAY-${index}`}</Text>
-            ))}
-          </Box>
-        </OverlayAbove>
+        <Box
+          position="absolute"
+          bottom="100%"
+          left={0}
+          right={0}
+          flexDirection="column"
+          overflow="hidden"
+          opaque
+          onClick={onOverlayClick}
+        >
+          {Array.from({ length: rows }, (_, index) => (
+            <Text key={index}>{`${label}-OVERLAY-${index}`}</Text>
+          ))}
+        </Box>
         <Text>{`${label}-ANCHOR`}</Text>
       </Box>
     </Box>
@@ -303,10 +314,21 @@ const termA = createTerm()
 const termB = createTerm()
 const isoRefA = React.createRef<TestScrollHandle>()
 const isoRefB = React.createRef<TestScrollHandle>()
+let overlayClicksA = 0
+let overlayClicksB = 0
+const stdoutA = new FakeStdout(termA) as unknown as NodeJS.WriteStream
+const stdoutB = new FakeStdout(termB) as unknown as NodeJS.WriteStream
 const appA = await render(
-  <IsolationFixture label="ISO-A" rows={6} scrollRef={isoRefA} />,
+  <AlternateScreen>
+    <IsolationFixture
+      label="ISO-A"
+      rows={6}
+      scrollRef={isoRefA}
+      onOverlayClick={() => { overlayClicksA += 1 }}
+    />
+  </AlternateScreen>,
   {
-    stdout: new FakeStdout(termA) as unknown as NodeJS.WriteStream,
+    stdout: stdoutA,
     stdin: new FakeStdin() as unknown as NodeJS.ReadStream,
     stderr: new FakeStderr() as unknown as NodeJS.WriteStream,
     exitOnCtrlC: false,
@@ -314,9 +336,16 @@ const appA = await render(
   },
 )
 const appB = await render(
-  <IsolationFixture label="ISO-B" rows={2} scrollRef={isoRefB} />,
+  <AlternateScreen>
+    <IsolationFixture
+      label="ISO-B"
+      rows={2}
+      scrollRef={isoRefB}
+      onOverlayClick={() => { overlayClicksB += 1 }}
+    />
+  </AlternateScreen>,
   {
-    stdout: new FakeStdout(termB) as unknown as NodeJS.WriteStream,
+    stdout: stdoutB,
     stdin: new FakeStdin() as unknown as NodeJS.ReadStream,
     stderr: new FakeStderr() as unknown as NodeJS.WriteStream,
     exitOnCtrlC: false,
@@ -325,7 +354,9 @@ const appB = await render(
 )
 await waitFor(
   'both renderer isolation fixtures',
-  () => termText(termA).includes('ISO-A-OVERLAY-5') &&
+  () => termA.buffer.active === termA.buffer.alternate &&
+    termB.buffer.active === termB.buffer.alternate &&
+    termText(termA).includes('ISO-A-OVERLAY-5') &&
     termText(termB).includes('ISO-B-OVERLAY-1'),
 )
 // Render B last, then scroll A. With shared absoluteRectsPrev/Cur, A would
@@ -344,6 +375,47 @@ check(
   ) &&
     liveB.includes('ISO-B-OVERLAY-1') &&
     !liveB.includes('ISO-A-OVERLAY'),
+)
+const overlayRow = (
+  target: InstanceType<typeof XTerm>,
+  marker: string,
+): number => {
+  const buffer = target.buffer.active
+  for (let row = 0; row < target.rows; row += 1) {
+    if ((buffer.getLine(row)?.translateToString(true) ?? '').includes(marker)) {
+      return row
+    }
+  }
+  return -1
+}
+const inkA = inkInstances.get(stdoutA)
+const inkB = inkInstances.get(stdoutB)
+type InkWithHitFrame = {
+  rootNode?: Parameters<typeof dispatchHitClick>[0]
+  frontFrame?: {
+    absoluteHitList?: readonly {
+      rect: { x: number; y: number; width: number; height: number }
+    }[]
+  }
+}
+const hitListA = (inkA as unknown as InkWithHitFrame)?.frontFrame?.absoluteHitList ?? []
+const hitListB = (inkB as unknown as InkWithHitFrame)?.frontFrame?.absoluteHitList ?? []
+const rootA = (inkA as unknown as InkWithHitFrame)?.rootNode
+const rootB = (inkB as unknown as InkWithHitFrame)?.rootNode
+const overlayRowA = overlayRow(termA, 'ISO-A-OVERLAY-0')
+const overlayRowB = overlayRow(termB, 'ISO-B-OVERLAY-0')
+const clickBHandled = overlayRowB >= 0
+  && hitListB[0] !== undefined
+  && rootB !== undefined
+  && dispatchHitClick(rootB, hitListB[0].rect.x + 1, hitListB[0].rect.y, false, 0, hitListB)
+const clickAHandled = overlayRowA >= 0
+  && hitListA[0] !== undefined
+  && rootA !== undefined
+  && dispatchHitClick(rootA, hitListA[0].rect.x + 1, hitListA[0].rect.y, false, 0, hitListA)
+check(
+  'interleaved renderers route absolute-overlay clicks only to their own tree',
+  clickAHandled && clickBHandled && overlayClicksA === 1 && overlayClicksB === 1,
+  `handled=${clickAHandled}/${clickBHandled}, clicks=${overlayClicksA}/${overlayClicksB}, rows=${overlayRowA}/${overlayRowB}, hits=${hitListA.length}/${hitListB.length}`,
 )
 appA.unmount()
 appB.unmount()
@@ -624,11 +696,11 @@ function FollowFixture({
 }
 
 type CapturedFrame = {
-  followScroll?: {
+  followScrolls?: readonly {
     delta: number
     viewportTop: number
     viewportBottom: number
-  } | null
+  }[]
 }
 type InkWithRenderer = {
   renderer: (options: unknown) => CapturedFrame
@@ -677,10 +749,13 @@ await waitFor(
   () =>
     followRef.current?.getScrollTop() === 34 &&
     followRef.current?.isSticky() === true &&
-    capturedFrames.some(frame => frame.followScroll?.delta === 2),
+    capturedFrames.some(frame => frame.followScrolls?.some(event => event.delta === 2)),
 )
-const followFrame = capturedFrames.find(frame => frame.followScroll?.delta === 2)
-const followFrameCount = capturedFrames.filter(frame => frame.followScroll?.delta === 2).length
+const followFrame = capturedFrames.find(frame =>
+  frame.followScrolls?.some(event => event.delta === 2))
+const followFrameCount = capturedFrames.filter(frame =>
+  frame.followScrolls?.some(event => event.delta === 2)).length
+const followEvent = followFrame?.followScrolls?.find(event => event.delta === 2)
 check(
   'overlay recompose records sticky follow exactly once',
   followFrameCount === 1 && stickyRestoreCount >= 1,
@@ -688,10 +763,9 @@ check(
 )
 check(
   'overlay recompose hands first-pass follow-scroll to Ink',
-  followFrame?.followScroll?.delta === 2 &&
-    followFrame.followScroll.viewportBottom -
-      followFrame.followScroll.viewportTop + 1 === 8,
-  JSON.stringify(followFrame?.followScroll ?? null),
+  followEvent?.delta === 2 &&
+    followEvent.viewportBottom - followEvent.viewportTop + 1 === 8,
+  JSON.stringify(followEvent ?? null),
 )
 unsubscribeFollow?.()
 followApp.unmount()

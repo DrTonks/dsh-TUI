@@ -5,7 +5,7 @@ import { PointerEvent } from './events/pointer-event.js'
 import { WheelEvent } from './events/wheel-event.js'
 import { logError } from '../utils/log.js'
 import { nodeCache } from './node-cache.js'
-import { getAbsoluteHitList } from './render-node-to-output.js'
+import type { AbsoluteHitEntry } from './render-node-to-output.js'
 import { dispatcher } from './reconciler.js'
 
 /**
@@ -65,8 +65,8 @@ export function hitTestWithOverlays(
   root: DOMElement,
   col: number,
   row: number,
+  overlays: readonly AbsoluteHitEntry[] = [],
 ): DOMElement | null {
-  const overlays = getAbsoluteHitList()
   for (let i = overlays.length - 1; i >= 0; i--) {
     const { node, rect } = overlays[i]!
     if (
@@ -108,9 +108,10 @@ export function dispatchClick(
   row: number,
   cellIsBlank = false,
   button = 0,
+  overlays: readonly AbsoluteHitEntry[] = [],
 ): boolean {
   let target: DOMElement | undefined =
-    hitTestWithOverlays(root, col, row) ?? undefined
+    hitTestWithOverlays(root, col, row, overlays) ?? undefined
   if (!target) return false
 
   // Click-to-focus: find the closest focusable ancestor and focus it.
@@ -213,8 +214,9 @@ export function dispatchWheel(
   deltaY: number,
   deltaX = 0,
   button = 0,
+  overlays: readonly AbsoluteHitEntry[] = [],
 ): boolean {
-  const target = hitTestWithOverlays(root, col, row)
+  const target = hitTestWithOverlays(root, col, row, overlays)
   if (!target) return false
   // Does any ancestor (target inclusive) carry an onWheel handler?
   let node: DOMElement | undefined = target
@@ -253,10 +255,11 @@ export function dispatchHover(
   col: number,
   row: number,
   hovered: Set<DOMElement>,
+  overlays: readonly AbsoluteHitEntry[] = [],
 ): void {
   const next = new Set<DOMElement>()
   let node: DOMElement | undefined =
-    hitTestWithOverlays(root, col, row) ?? undefined
+    hitTestWithOverlays(root, col, row, overlays) ?? undefined
   while (node) {
     const h = node._eventHandlers as EventHandlerProps | undefined
     if (h?.onMouseEnter || h?.onMouseLeave) next.add(node)

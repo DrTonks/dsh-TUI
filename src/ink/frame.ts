@@ -1,6 +1,10 @@
 import type { Cursor } from './cursor.js'
 import type { Size } from './layout/geometry.js'
-import type { FollowScroll, ScrollHint } from './render-node-to-output.js'
+import type {
+  AbsoluteHitEntry,
+  FollowScroll,
+  ScrollHint,
+} from './render-node-to-output.js'
 import {
   type CharPool,
   createScreen,
@@ -23,8 +27,10 @@ export type Frame = {
   readonly scrollHint?: ScrollHint | null
   /** A ScrollBox has remaining pendingScrollDelta — schedule another frame. */
   readonly scrollDrainPending?: boolean
-  /** At-bottom follow delta produced by this renderer invocation. */
-  readonly followScroll?: FollowScroll | null
+  /** Absolute nodes painted by this renderer invocation, in paint order. */
+  readonly absoluteHitList?: readonly AbsoluteHitEntry[]
+  /** Scroll events produced by this renderer invocation. */
+  readonly followScrolls?: readonly FollowScroll[]
 }
 
 /**
