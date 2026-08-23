@@ -261,11 +261,15 @@ export function PlanReviewPanel({
           const absoluteIndex = optionWindow.start + index
           const focused = absoluteIndex === focusIndex
           const isApprove = option.label === approveLabel
-          const marker = absoluteIndex === optionWindow.start && optionWindow.start > 0
-            ? '↑'
-            : absoluteIndex === optionWindow.end - 1 && optionWindow.end < options.length
-              ? '↓'
-              : focused ? POINTER : ' '
+          // The focused decision must retain its pointer even when a one-row
+          // window also places it on a continuation boundary.
+          const marker = focused
+            ? POINTER
+            : absoluteIndex === optionWindow.start && optionWindow.start > 0
+              ? '↑'
+              : absoluteIndex === optionWindow.end - 1 && optionWindow.end < options.length
+                ? '↓'
+                : ' '
           return (
             <Box key={`${absoluteIndex}:${option.label}`} flexDirection="row">
               <Box width={1} flexShrink={0}>
@@ -395,7 +399,7 @@ export function PlanReviewPanel({
         </Box>
       )}
       <Box marginTop={1}>
-        <Text dimColor>{t('plan-review-hint')}</Text>
+        <Text dimColor>{t('plan-review-hint-standalone')}</Text>
       </Box>
     </Box>
   )

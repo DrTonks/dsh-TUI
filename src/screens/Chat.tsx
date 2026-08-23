@@ -2496,8 +2496,11 @@ export function Chat({
   })
   const questionOverlayOpen = questionSnapshot !== null && approvalSnapshot === null
     && dialogSnapshot === null && overlay.kind !== 'tips' && btw === null
-  const questionBoundaryGap = questionAvailableRows < 10 ? 0 : 1
-  const questionPanelRows = Math.max(1, questionAvailableRows - questionBoundaryGap)
+  // Reserve the renderer boundary cell at the *top* of roomy overlays. The
+  // bottom stays flush with StatusLine so the final multiline prompt row can
+  // never show through between the opaque questionnaire and status chrome.
+  const questionTopBoundaryReserve = questionAvailableRows < 10 ? 0 : 1
+  const questionPanelRows = Math.max(1, questionAvailableRows - questionTopBoundaryReserve)
 
   // The sticky header pins the turn owning the viewport top row
   // (timeline.activeId, reported by MessageList) — scrolled up to an old
@@ -2720,7 +2723,7 @@ export function Chat({
         <Box ref={questionAnchorRef} flexDirection="column" width="100%">
           {questionOverlayOpen && questionSnapshot !== null && (
             <OverlayAbove
-              bottom={questionStatusRows + questionBoundaryGap}
+              bottom={questionStatusRows}
               maxHeight={questionPanelRows}
             >
               <AskUserQuestionPanel
