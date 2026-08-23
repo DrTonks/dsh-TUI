@@ -165,6 +165,23 @@ function topOwningTurn(): number | null {
   }
   return null
 }
+async function waitForStableInitialRailAlignment(timeoutMs = 6000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  let consecutive = 0
+  while (Date.now() < deadline) {
+    const snap = railSnapshot()
+    const owner = topOwningTurn()
+    const activeIndex = snap.activeRow === null ? -1 : snap.ticks.indexOf(snap.activeRow)
+    const aligned = snap.ticks.length === 8 && owner !== null && activeIndex === owner - 1
+    consecutive = aligned ? consecutive + 1 : 0
+    // The logo's opening animation can move the transcript boundary after a
+    // single aligned frame. Require a short stable window instead of racing a
+    // fixed 700 ms sleep on slower CI runners.
+    if (consecutive >= 4) return true
+    await sleep(100)
+  }
+  return false
+}
 const wheel = async (up: boolean, times: number) => {
   for (let i = 0; i < times; i++) {
     stdin.write(`\x1b[<${up ? 64 : 65};90;30M`)
@@ -182,6 +199,7 @@ const hoverAt = async (col: number, row: number) => {
 }
 
 // ── 1. 底部：rail 出现，8 tick，恰一个 ━━，active 顶部锚定 ──
+await waitForStableInitialRailAlignment()
 {
   const snap = railSnapshot()
   check('rail 出现（▲/▼/tick 齐）', snap.upRow !== null && snap.downRow !== null && snap.ticks.length > 0,
