@@ -368,6 +368,9 @@ const dict = {
   'input-pending-steer-label': { zh: '插话 · 下一步送达', en: 'Steer · delivered next' },
   'input-pending-queue-label': { zh: '排队 · 回合结束后送达', en: 'Queued · delivered after the turn' },
   'input-pending-actions-hint': { zh: '撤回 · Esc 打断并立即发送', en: 'Retract · Esc interrupts and sends immediately' },
+  'input-fold-stats': { zh: '{{lines}} 行 · {{chars}} 字', en: '{{lines}} lines · {{chars}} chars' },
+  'input-fold-hover': { zh: '悬停查看', en: 'hover to peek' },
+  'input-fold-peek-footer': { zh: '… 共 {{lines}} 行 · 点击展开编辑', en: '… {{lines}} lines total · click to edit' },
 
   // ── components/whaleFrames.ts (frame labels) ────────────────────────
   'frame-blink': { zh: '眨眼', en: 'blink' },
