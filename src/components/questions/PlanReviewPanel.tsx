@@ -212,6 +212,17 @@ export function PlanReviewPanel({
   }, { isActive: true })
 
   const cursorChar = cursor < feedback.length ? feedback[cursor] : ' '
+  /** Mouse: click a decision row = focus it + submit (same as Enter). */
+  const [hoverIndex, setHoverIndex] = React.useState(-1)
+  const clickOption = (index: number): void => {
+    setFocusIndex(index)
+    submitOption(index)
+  }
+  /** Mouse: click the feedback row to focus it. */
+  const focusFeedbackRow = (): void => {
+    setFocusIndex(options.length)
+    setError(null)
+  }
 
   // Inside Chat the panel is an absolute overlay and therefore has a hard
   // physical row budget. Pin decisions, feedback and controls below a
@@ -316,7 +327,15 @@ export function PlanReviewPanel({
           const focused = index === focusIndex
           const isApprove = option.label === approveLabel
           return (
-            <Box key={option.label} flexDirection="row" marginTop={focused ? 1 : 0}>
+            <Box
+              key={option.label}
+              flexDirection="row"
+              marginTop={focused ? 1 : 0}
+              onClick={() => clickOption(index)}
+              onMouseEnter={() => setHoverIndex(index)}
+              onMouseLeave={() => setHoverIndex(current => (current === index ? -1 : current))}
+              backgroundColor={hoverIndex === index && !focused ? 'userMessageBackgroundHover' : undefined}
+            >
               <Box width={1} flexShrink={0}>
                 <Text color={focused ? 'claude' : undefined} bold={focused}>
                   {focused ? POINTER : ' '}
@@ -339,7 +358,14 @@ export function PlanReviewPanel({
             </Box>
           )
         })}
-        <Box flexDirection="row" marginTop={inputFocused ? 1 : 0}>
+        <Box
+          flexDirection="row"
+          marginTop={inputFocused ? 1 : 0}
+          onClick={focusFeedbackRow}
+          onMouseEnter={() => setHoverIndex(options.length)}
+          onMouseLeave={() => setHoverIndex(current => (current === options.length ? -1 : current))}
+          backgroundColor={hoverIndex === options.length && !inputFocused ? 'userMessageBackgroundHover' : undefined}
+        >
           <Box width={1} flexShrink={0}>
             <Text color={inputFocused ? 'claude' : undefined} bold={inputFocused}>
               {inputFocused ? POINTER : ' '}

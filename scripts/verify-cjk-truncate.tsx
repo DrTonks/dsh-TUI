@@ -70,9 +70,13 @@ class FakeStdout extends Writable {
   _write(chunk: unknown, _e: BufferEncoding, cb: () => void) { term.write(String(chunk), cb) }
 }
 
-// descriptionWidth = COLS - 24 = 4，'directory'（9 列）必走截断路径 → 'dir…' 恰好 4 列；
-// CJK 文件名走 `20 - stringWidth(name)` 的 padding 路径。
-const files = ['中文目录名/', 'src/中文文件.ts', 'README.md']
+// descriptionWidth 在 28 列下会小于 'directory'（9 列），必走截断路径产生 '…'；
+// 候选现在结构化（FileCandidate），fixture 保持与 PromptInput 相同的对象形态。
+const files = [
+  { id: '中文目录名/', path: '中文目录名/', displayPath: '中文目录名/', name: '中文目录名', kind: 'directory', score: 0 },
+  { id: 'src/中文文件.ts', path: 'src/中文文件.ts', displayPath: 'src/中文文件.ts', name: '中文文件.ts', kind: 'file', score: 0 },
+  { id: 'README.md', path: 'README.md', displayPath: 'README.md', name: 'README.md', kind: 'file', score: 0 },
+]
 const app = await render(
   React.createElement(FileSuggestions, { files, selectedIndex: 0, columns: COLS }),
   { stdout: new FakeStdout(), exitOnCtrlC: false, patchConsole: false },

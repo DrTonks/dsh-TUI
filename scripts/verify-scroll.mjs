@@ -9,8 +9,16 @@
  *
  * Scenario: 60-row content in a 24-row viewport (maxScroll 36). Scroll
  * away from the top, then re-render with 20 rows (shrink: maxScroll 0),
- * then back to 60 (grow). The shrink frame must keep the pre-frame
- * scrollTop (36 / 10), never 0.
+ * then back to 60 (grow). A MID-SCROLL shrink frame must keep the
+ * pre-frame scrollTop (10), never 0.
+ *
+ * Exception (#421/#422 contract): scrolling to the EXACT bottom re-pins
+ * sticky (the wheel-tremor restore in render-node-to-output). A sticky
+ * view on a shrink frame clamps to the shrunken maxScroll instead of
+ * freezing — the freeze would park scrollTop past the whole collapsed
+ * content and paint blank; clamping shows the (real) bottom rows.
+ * "Nothing renderable exists below maxScroll" — so the bottom-scrolled
+ * shrink frame now expects scrollTop 0 (= collapsed maxScroll).
  *
  * Run with plain node against the compiled lib: `node scripts/verify-scroll.mjs`
  */
@@ -93,11 +101,13 @@ async function run() {
 
   // ---- shrink frame: 20 rows → content collapses to the viewport height
   // (24; the content wrapper flexGrows to at least the viewport), so
-  // maxScroll = 0. Must NOT jump to 0.
+  // maxScroll = 0. scrollTo(36) landed on the exact bottom, which re-pins
+  // sticky; a sticky shrink frame clamps to the collapsed maxScroll (#421:
+  // freezing past the content paints blank — see the docstring exception).
   instance.rerender(makeScroller(20))
   await sleep(400)
   const shrinkFrame = frameLog.find(f => f.scrollHeight === 24)
-  check('shrink frame keeps the scrolled position (no jump to top)', shrinkFrame !== undefined && shrinkFrame.scrollTop === 36, JSON.stringify(shrinkFrame ?? frameLog.at(-1)))
+  check('shrink frame clamps the re-pinned sticky view to the collapsed bottom', shrinkFrame !== undefined && shrinkFrame.scrollTop === 0, JSON.stringify(shrinkFrame ?? frameLog.at(-1)))
 
   // ---- grow back: 60 rows. Position re-validated at the bottom.
   instance.rerender(makeScroller(60))

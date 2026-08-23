@@ -8,3 +8,5 @@ package-lock.json
 .tmp/
 AGENTS.md
 .dsh-prompt-debug.json
+HANDOVER.md
+.local/

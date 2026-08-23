@@ -192,6 +192,7 @@ function makeChannel(overrides: Record<string, unknown> = {}): Record<string, un
       tps: false,
       gitBranch: false,
       sessionTitle: false,
+      sessionId: false,
       mode: false,
       contextBar: false,
       activity: false,
@@ -532,12 +533,20 @@ function makeChannel(overrides: Record<string, unknown> = {}): Record<string, un
   await sleep(400)
 
   // The settle paint is throttled behind the ink frame clock — poll for the
-  // markers instead of racing a fixed sleep.
+  // markers instead of racing a fixed sleep. The ceiling is generous (~15s)
+  // on purpose: this check asserts the FINAL LAYOUT (no blank band between
+  // the two sections), not paint latency, and the old 4s window straddled
+  // the settle-paint latency distribution — it failed with first=-1/
+  // second=-1 (markers not yet on screen) in ~1/3 of local runs while the
+  // very next assertion passed 400ms later. Green paths break out early;
+  // only a real layout regression (or a paint that never lands) pays the
+  // full ceiling.
+  const settlePollStart = Date.now()
   let lines: string[] = []
   let firstIndex = -1
   let secondIndex = -1
   let gap = Number.POSITIVE_INFINITY
-  for (let attempt = 0; attempt < 50; attempt++) {
+  for (let attempt = 0; attempt < 187; attempt++) {
     const buffer = term.buffer.active
     lines = Array.from({ length: buffer.length }, (_, row) =>
       buffer.getLine(row)?.translateToString(true) ?? '',
@@ -556,10 +565,14 @@ function makeChannel(overrides: Record<string, unknown> = {}): Record<string, un
     if (firstIndex >= 0 && secondIndex >= 0 && gap <= 1) break
     await sleep(80)
   }
+  const settleWaitedMs = Date.now() - settlePollStart
   check(
     'reasoning that settles in the trajectory leaves no blank answer gap',
     firstIndex >= 0 && secondIndex >= 0 && gap <= 1,
-    `first=${firstIndex}, second=${secondIndex}, blank=${gap}, buffer=${lines.length}`,
+    `first=${firstIndex}, second=${secondIndex}, blank=${gap}, buffer=${lines.length}, waited=${settleWaitedMs}ms` +
+      (firstIndex < 0 || secondIndex < 0
+        ? ' (markers never painted within the 15s window — hung or lost frame, not a layout gap)'
+        : ''),
   )
 
   stdin.write('\x0f') // Ctrl+O
@@ -629,9 +642,14 @@ function makeChannel(overrides: Record<string, unknown> = {}): Record<string, un
 
   // B — the wake strip lives on the hint row, and every assertion below is
   // scoped to that row on purpose: the startup tip also names the key, so a
-  // whole-screen search could not tell the two channels apart.
+  // whole-screen search could not tell the two channels apart. The `/tips`
+  // guard is the same discipline: the logo tip line always ends with
+  // "… · /tips 更多技巧" and 1-in-90 tips (keys-help) even contains
+  // "快捷键", which made the finder grab the TIP row, never the status row
+  // (CI flake, verify-trace-scene ladder step). The status line never
+  // contains "/tips", so excluding it pins the finder to the real hint row.
   const hintRowOf = (text: string): string =>
-    text.split('\n').find(line => line.includes('shortcuts') || line.includes('快捷键')) ?? ''
+    text.split('\n').find(line => !line.includes('/tips') && (line.includes('shortcuts') || line.includes('快捷键'))) ?? ''
   const statusArea = hintRowOf(startup)
   check('the status line carries a live wake strip', /[▁▂▃▄▅▆▇█]/.test(statusArea),
     statusArea.trim().slice(-42))
@@ -712,7 +730,15 @@ function makeChannel(overrides: Record<string, unknown> = {}): Record<string, un
     let hintRow: string | undefined
     for (let attempt = 0; attempt < 25; attempt++) {
       const rows = screen().split('\n')
-      hintRow = rows.find(line => /[▁▂▃▄▅▆▇█▶·]/.test(line) && (line.includes('shortcuts') || line.includes('快捷键')))
+      // Same `/tips` guard as hintRowOf above: the glyph class includes the
+      // middle dot, and the logo tip line ("… · /tips 更多技巧") always has
+      // one — when the random startup tip happens to contain "快捷键"
+      // (keys-help, 1/90) the finder matched the TIP row and this check
+      // failed as "wake sits … ends at 104" after polling to exhaustion.
+      hintRow = rows.find(line =>
+        /[▁▂▃▄▅▆▇█▶·]/.test(line)
+        && !line.includes('/tips')
+        && (line.includes('shortcuts') || line.includes('快捷键')))
       const settledAtRight = hintRow !== undefined
         && stringWidth(hintRow.replace(/\s+$/, '')) === cols - 1
       if (settledAtRight || miniWakeWidth(cols) === 0) break

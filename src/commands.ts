@@ -93,7 +93,6 @@ export const LOCAL_COMMANDS: LocalCommand[] = [
   { name: 'provider', description: 'Add an LLM provider (catalog or custom API endpoint)' },
   { name: 'login', description: 'Show API credential status' },
   { name: 'logout', description: 'Clear the API credential' },
-  { name: 'permissions', description: 'Show permission policy status' },
   { name: 'add-dir', description: 'Show the filesystem policy scope' },
   { name: 'hooks', description: 'Show hooks status' },
   { name: 'mcp', description: 'Show MCP status' },
@@ -224,7 +223,10 @@ export function completeCommands(
 ): CommandCompletion[] {
   if (!input.startsWith('/') || /[\r\n]/u.test(input)) return []
   const body = input.slice(1)
-  if (!/^[a-z0-9_-]*(?:[\t ]+[a-z0-9_-]*)*$/iu.test(body)) return []
+  // Token charset includes `. : /` so provider/model specs (e.g.
+  // `deepseek/deepseek-v4-flash`, `openai/gpt-4.1`) survive as ONE token —
+  // the /model completion matches its candidates against the whole spec.
+  if (!/^[a-z0-9_.:\/-]*(?:[\t ]+[a-z0-9_.:\/-]*)*$/iu.test(body)) return []
   const trailingSeparator = /[\t ]$/u.test(body)
   const tokens = body.split(/[\t ]+/u)
   const prefix = trailingSeparator ? '' : (tokens.pop() ?? '')

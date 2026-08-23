@@ -109,8 +109,14 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'keys-home-end',
     group: 'keys',
-    zh: 'Home/End 与 Ctrl+A 快速到行首/行尾',
-    en: 'Home/End and Ctrl+A jump to line start/end',
+    zh: 'Home/End 到行首/行尾，Ctrl+E 到行尾',
+    en: 'Home/End jump to line start/end; Ctrl+E to line end',
+  },
+  {
+    id: 'keys-ctrl-a',
+    group: 'keys',
+    zh: 'Ctrl+A 子代理面板：Enter 看详情 · X 中断 · Esc 关',
+    en: 'Ctrl+A opens the subagent dashboard; Enter details, X interrupt, Esc close',
   },
   {
     id: 'keys-edit-keys',
@@ -151,8 +157,14 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'keys-mouse-click',
     group: 'keys',
-    zh: '单击消息行展开/收起；点链接直接打开浏览器',
-    en: 'Click a message row to expand it; click links to open the browser',
+    zh: '工具卡/thinking/摘要点击展开，子代理卡点击看详情；输入框点击定位光标',
+    en: 'Click tool/thinking/summary rows to fold; subagent cards open detail; click input to move caret',
+  },
+  {
+    id: 'keys-mouse-scenes',
+    group: 'keys',
+    zh: '轨迹与 /settings 支持鼠标：行点击跳转/编辑，滚轮移动光标或焦点',
+    en: 'Trajectory and /settings take the mouse: row clicks jump/edit, the wheel moves cursor or focus',
   },
 
   // ── 命令 ──────────────────────────────────────────────────
@@ -333,8 +345,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'cmd-permission',
     group: 'commands',
-    zh: '/permission 切换权限预设（read-only/workspace/full）',
-    en: '/permission switches permission presets (read-only/workspace/full)',
+    zh: '/permission 弹出权限预设选择器（只读/工作区读写/完全访问）',
+    en: '/permission opens the permission-preset picker (read-only/workspace-write/full)',
   },
   {
     id: 'cmd-plan-goal',
@@ -377,8 +389,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'flow-at',
     group: 'workflow',
-    zh: '任意位置 @ 补全文件，@ink 也能命中 src/ink',
-    en: '@ completes files anywhere; @ink matches src/ink',
+    zh: '@ 补全支持模糊匹配；@src/ 直达该目录',
+    en: '@ completes files with fuzzy matching; @dir/ lists that directory',
   },
   {
     id: 'flow-question-type',
@@ -417,6 +429,36 @@ export const TIPS: readonly Tip[] = [
     group: 'display',
     zh: '底栏 TPS、轨迹条、上下文条默认关，/settings 里打开',
     en: 'TPS, trajectory, context bars are off by default — enable in /settings',
+  },
+  {
+    id: 'disp-statusbar-session-id',
+    group: 'display',
+    zh: '底栏可显示短会话 ID（# 前 8 位），与日志文件名对应，/settings 里开',
+    en: 'Footer can show the short session id (# + 8 chars, matches the log filename) — enable in /settings',
+  },
+  {
+    id: 'disp-statusbar-title',
+    group: 'display',
+    zh: '底栏可显示会话标题；/rename 随时改',
+    en: 'Footer can show the session title; rename anytime with /rename',
+  },
+  {
+    id: 'disp-statusbar-fields',
+    group: 'display',
+    zh: '底栏字段逐项开关：token 总量、git 分支、模式、活动摘要…… /settings 里配',
+    en: 'Footer fields are per-field switches: token totals, git branch, mode, activity — set in /settings',
+  },
+  {
+    id: 'disp-statusbar-compact',
+    group: 'display',
+    zh: '底栏 compact 开=单行收纳；关=左右分组（指标在左、位置在右）',
+    en: 'Footer compact on = one merged line; off = metrics left, location right',
+  },
+  {
+    id: 'disp-statusbar-hint',
+    group: 'display',
+    zh: "空闲时 '? 查看快捷键' 常驻提示也是底栏开关（shortcutHint）",
+    en: 'The idle "? for shortcuts" reminder is itself a footer switch (shortcutHint)',
   },
   {
     id: 'disp-context-warn',
@@ -485,6 +527,18 @@ export const TIPS: readonly Tip[] = [
     en: 'Drag-select copies instantly in fullscreen; Esc cancels',
   },
   {
+    id: 'disp-hover-footer',
+    group: 'display',
+    zh: '悬停底栏字段：ctx 原地变等宽压力条，明细走常驻底行，布局不动',
+    en: 'Hover footer fields: ctx morphs in place into a same-width bar, details on a stable line',
+  },
+  {
+    id: 'disp-wheel-sel',
+    group: 'display',
+    zh: '有文本选区时，滚轮平移选区而非滚动列表',
+    en: 'With a text selection, the wheel translates the selection, not the list',
+  },
+  {
     id: 'disp-whale',
     group: 'display',
     zh: '首屏鲸鱼动画（终端 ≥64 列才显示）',
@@ -535,6 +589,12 @@ export const TIPS: readonly Tip[] = [
     en: 'On version skew, follow the npm install -g hint to align the launcher',
   },
   {
+    id: 'pit-drift',
+    group: 'pitfalls',
+    zh: 'logo ⚠ 提示 dsh 版本不符时，按提示 npm i -g @deepseek-ai/dsh 对齐',
+    en: 'When the logo warns about dsh versions, follow the npm i -g @deepseek-ai/dsh hint',
+  },
+  {
     id: 'pit-mac',
     group: 'pitfalls',
     zh: 'macOS ⌘ 键需 iTerm2/kitty/WezTerm/ghostty/tmux',
@@ -555,8 +615,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'pit-mouse-mode',
     group: 'pitfalls',
-    zh: '鼠标操作仅在全屏模式（fullscreen）下生效',
-    en: 'Mouse support only works in fullscreen mode',
+    zh: '主界面鼠标需开 fullscreen；轨迹/resume 整屏页两种模式都带鼠标',
+    en: 'Main-chat mouse needs fullscreen; full-page screens (trajectory, /resume) have it in both modes',
   },
   {
     id: 'pit-env-rename',

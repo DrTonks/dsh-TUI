@@ -72,6 +72,7 @@ function makeHarness(columns = 140, rows = 12) {
 
 const baseChannel = {
   statusBar: { ...DEFAULT_STATUS_BAR },
+  agentId: 'd5a3b7c9-e1f2-4a6b-8c3d-0123456789ab',
   lastUsage: { input: 200_000, cacheRead: 5_000, cacheWrite: 1_000, output: 6_789 },
   contextWindow: 266_000,
   reasoningEffort: 'max',
@@ -161,6 +162,8 @@ check('DEFAULT_STATUS_BAR keeps the intended compact defaults', () => {
     tps: false,
     gitBranch: false,
     sessionTitle: false,
+    sessionId: false,
+    goal: true,
     mode: false,
     contextBar: false,
     activity: false,
@@ -211,10 +214,18 @@ check('compact StatusLine shows model, effort, cwd basename, context, and cache'
 })
 
 check('compact StatusLine hides disabled optional fields', () => {
-  for (const marker of ['37 t/s', 'feat/display-settings-probe', 'display settings title probe', '12.3k→6.8k', 'system', 'free']) {
+  for (const marker of ['37 t/s', 'feat/display-settings-probe', 'display settings title probe', '#d5a3b7c9', '12.3k→6.8k', 'system', 'free']) {
     assert.ok(!compact.includes(marker), `unexpected ${JSON.stringify(marker)} in:\n${compact}`)
   }
   assert.ok(!/[▁▂▃▄▅▆▇█▶]/.test(compact), `unexpected trajectory wake in:\n${compact}`)
+})
+
+const withSessionId = await renderStatus({
+  statusBar: { ...DEFAULT_STATUS_BAR, sessionId: true },
+})
+check('session id switch shows the # + 8-char short id', () => {
+  assert.ok(withSessionId.includes('#d5a3b7c9'), `missing short session id in:\n${withSessionId}`)
+  assert.ok(!withSessionId.includes('d5a3b7c9-e1f2'), `full id leaked in:\n${withSessionId}`)
 })
 
 check('compact StatusLine hides the shortcuts hint by default', () => {
@@ -226,6 +237,28 @@ const compactWithShortcutHint = await renderStatus({
 })
 check('compact StatusLine renders the enabled shortcuts hint exactly once', () => {
   assert.equal((compactWithShortcutHint.match(/\? for shortcuts/g) ?? []).length, 1)
+})
+
+const probeGoal = {
+  id: 'g-probe',
+  revision: 1,
+  objective: 'probe goal objective',
+  phase: 'active',
+  maxGoalRounds: 5,
+  roundsStarted: 2,
+} as const
+
+const withGoal = await renderStatus({ goal: probeGoal })
+check('compact StatusLine renders the goal chip when a goal exists', () => {
+  assert.ok(withGoal.includes('● 2/5'), `missing goal chip in:\n${withGoal}`)
+})
+
+const withGoalHidden = await renderStatus({
+  goal: probeGoal,
+  statusBar: { ...DEFAULT_STATUS_BAR, goal: false },
+})
+check('goal chip respects the statusBar.goal switch', () => {
+  assert.ok(!withGoalHidden.includes('2/5'), `unexpected goal chip in:\n${withGoalHidden}`)
 })
 
 const working = await renderStatus({ working: true })
@@ -269,12 +302,13 @@ const fullStatus = {
   tps: true,
   gitBranch: true,
   sessionTitle: true,
+  sessionId: true,
   contextBar: true,
   trajectory: true,
 }
 const full = await renderStatus({ statusBar: fullStatus }, 200)
 check('full StatusLine exposes tps, git, title, and token totals', () => {
-  for (const marker of ['37 t/s', 'feat/display-settings-probe', 'display settings title probe', '12.3k→6.8k']) {
+  for (const marker of ['37 t/s', 'feat/display-settings-probe', 'display settings title probe', '#d5a3b7c9', '12.3k→6.8k']) {
     assert.ok(full.includes(marker), `missing ${JSON.stringify(marker)} in:\n${full}`)
   }
 })

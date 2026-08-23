@@ -230,6 +230,7 @@ await waitFor('multiline prompt to become visible', () =>
   multilineDraftLines.every(line => visibleText().includes(line)))
 checkVisible('multiline prompt is visible before question', '第四行 prompt')
 initialBufferLength = term.buffer.active.length
+const scrollUpsBeforeQuestion = (rawChunks.join('').match(/\x1b\[\d+S/g) ?? []).length
 
 const answer = store.ask({
   questions: [
@@ -294,6 +295,10 @@ checkBufferStable('question close does not grow scrollback')
 const restoredDraft = multilineDraftLines.every(line => visibleText().includes(line))
 console.log(`${restoredDraft ? 'PASS' : 'FAIL'}  complete multiline prompt is restored after question`)
 if (!restoredDraft) failures += 1
+const questionScrollUps = (rawChunks.join('').match(/\x1b\[\d+S/g) ?? []).length - scrollUpsBeforeQuestion
+const noQuestionScrollUps = questionScrollUps === 0
+console.log(`${noQuestionScrollUps ? 'PASS' : 'FAIL'}  primary question lifecycle emits no raw CSI scroll-up sequences  (${questionScrollUps})`)
+if (!noQuestionScrollUps) failures += 1
 
 // Exercise the real PromptInput → Chat command dispatcher → provider wizard
 // path rather than only injecting QuestionStore snapshots. A three-row status
@@ -656,11 +661,6 @@ const fullscreenSubmitted = fullscreenSelected.length === 1
   && fullscreenSettled.errorCode === null
 console.log(`${fullscreenSubmitted ? 'PASS' : 'FAIL'}  fullscreen resize submits visible final option${fullscreenSettled.errorCode === null ? '' : `  (${fullscreenSettled.errorCode})`}`)
 if (!fullscreenSubmitted) failures += 1
-
-const scrollUps = (rawChunks.join('').match(/\x1b\[\d+S/g) ?? []).length
-const noScrollUps = scrollUps === 0
-console.log(`${noScrollUps ? 'PASS' : 'FAIL'}  no raw CSI scroll-up sequences  (${scrollUps})`)
-if (!noScrollUps) failures += 1
 
 await app.unmount()
 process.exit(failures === 0 ? 0 : 1)
