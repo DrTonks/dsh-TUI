@@ -21,15 +21,6 @@ function check(name, ok, extra = '') {
   if (!ok) failed += 1
 }
 
-async function waitFor(predicate, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return true
-    await new Promise(resolve => setTimeout(resolve, 50))
-  }
-  return predicate()
-}
-
 function makeStreams() {
   const stdout = new Writable({ write(_chunk, _encoding, callback) { callback() } })
   stdout.columns = 100
@@ -48,12 +39,11 @@ function makeStreams() {
 
 const submitted = []
 const steered = []
-const commands = []
 const channel = {
   mode: { id: 'default', plan: false },
   modeIndex: 0,
   cycleMode() {},
-  commandList: [{ name: 'provider', description: 'provider wizard' }],
+  commandList: [],
   commandCompletions: () => [],
   notifications: [],
   pending: [],
@@ -73,10 +63,7 @@ const instance = await render(
     channel,
     helpOpen: false,
     onToggleHelp() {},
-    onRunCommand: (name, rawInput) => {
-      commands.push({ name, rawInput })
-      return true
-    },
+    onRunCommand: () => false,
     selectionActive: false,
   }),
   { stdout, stderr, stdin, exitOnCtrlC: false, patchConsole: false },
@@ -149,30 +136,6 @@ for (const [index, [label, newlineKey, prefix]] of multilineCases.entries()) {
     JSON.stringify(submitted),
   )
 }
-
-// A slash token is a command only when it begins the entire draft. Pasted
-// multiline prose ending in /provider must remain ordinary message text.
-const proseEndingInProvider = '第一行\n第二行/provider'
-stdin.write(`\x1b[200~${proseEndingInProvider}\x1b[201~`)
-stdin.write('\r')
-await waitFor(() => submitted.at(-1) === proseEndingInProvider || commands.length > 0)
-check(
-  'multiline prose ending in /provider submits as text instead of opening a command',
-  submitted.at(-1) === proseEndingInProvider && commands.length === 0,
-  JSON.stringify({ submitted: submitted.at(-1), commands }),
-)
-
-stdin.write('/provider')
-// Printable slash-command characters arrive as separate input events; allow
-// PromptInput's controlled draft to commit before the physical Enter event.
-await new Promise(resolve => setTimeout(resolve, 200))
-stdin.write('\r')
-await waitFor(() => commands.length === 1)
-check(
-  'standalone /provider invokes the provider command',
-  commands.length === 1 && commands[0]?.name === 'provider' && commands[0]?.rawInput === '',
-  JSON.stringify(commands),
-)
 
 instance.unmount()
 

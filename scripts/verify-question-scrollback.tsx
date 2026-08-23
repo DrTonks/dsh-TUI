@@ -9,12 +9,13 @@ process.env.TERM_PROGRAM = 'WezTerm'
 process.env.DSH_TUI_THEME = 'dark'
 process.env.DSH_TUI_LANG = 'zh'
 
-const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { ApprovalStore }] = await Promise.all([
+const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render, AlternateScreen }, { Chat }, { PlanReviewPanel }, { QuestionStore }, { ApprovalStore }] = await Promise.all([
   import('node:stream'),
   import('react'),
   import('@xterm/headless'),
   import('../src/ui.js'),
   import('../src/screens/Chat.js'),
+  import('../src/components/questions/PlanReviewPanel.js'),
   import('../src/dsh-adapter/questions.js'),
   import('../src/dsh-adapter/approvals.js'),
 ])
@@ -25,13 +26,21 @@ const term = new XTerm({ cols: COLS, rows: ROWS, scrollback: 2000, allowProposed
 const rawChunks: string[] = []
 
 class FakeStdout extends Writable {
-  columns = COLS
-  rows = ROWS
+  columns: number
+  rows: number
   isTTY = true
+  constructor(
+    private readonly target = term,
+    private readonly chunks = rawChunks,
+  ) {
+    super()
+    this.columns = target.cols
+    this.rows = target.rows
+  }
   _write(chunk: unknown, _encoding: BufferEncoding, callback: () => void) {
     const text = String(chunk)
-    rawChunks.push(text)
-    term.write(text, callback)
+    this.chunks.push(text)
+    this.target.write(text, callback)
   }
 }
 
@@ -58,6 +67,29 @@ async function waitFor(
   throw new Error(
     `Timed out after ${timeoutMs}ms waiting for: ${stage}\n` +
     `--- visible terminal ---\n${visibleText()}`,
+  )
+}
+async function waitForOutputIdle(
+  stage: string,
+  quietMs = 600,
+  timeoutMs = 10000,
+  intervalMs = 50,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastChunkCount = rawChunks.length
+  let quietSince = Date.now()
+  while (Date.now() < deadline) {
+    if (rawChunks.length !== lastChunkCount) {
+      lastChunkCount = rawChunks.length
+      quietSince = Date.now()
+    } else if (Date.now() - quietSince >= quietMs) {
+      return
+    }
+    await sleep(intervalMs)
+  }
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for output to settle: ${stage}\n` +
+    `chunks=${rawChunks.length}\n--- visible terminal ---\n${visibleText()}`,
   )
 }
 const longOptions = Array.from({ length: 18 }, (_, index) => ({
@@ -186,10 +218,14 @@ async function resizeAndWait(columns: number, rows: number, stage: string): Prom
 
 let failures = 0
 let initialBufferLength = 0
-function check(stage: string, exact = false) {
+let splashBeforeQuestion = 0
+function checkSplashNotIncreased(stage: string, expectRestored = false) {
   const count = splashCount()
-  const ok = exact ? count === 1 : count <= 1
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${stage}: splash copies=${count}, buffer lines=${term.buffer.active.length}`)
+  const ok = splashBeforeQuestion >= 1
+    && (expectRestored ? count === splashBeforeQuestion : count <= splashBeforeQuestion)
+  console.log(
+    `${ok ? 'PASS' : 'FAIL'}  ${stage}: splash before question=${splashBeforeQuestion}, current=${count}, buffer lines=${term.buffer.active.length}`,
+  )
   if (!ok) failures += 1
 }
 
@@ -208,10 +244,6 @@ function checkVisible(stage: string, marker: string) {
   if (!ok) failures += 1
 }
 
-await waitFor('initial splash', () => splashCount() === 1)
-initialBufferLength = term.buffer.active.length
-check('initial render', true)
-
 // A pasted multiline draft grows PromptInput to its five-row cap. Opening a
 // question must freeze this measured seat rather than collapse to the old
 // hard-coded three rows; the opaque overlay must hide every draft row while
@@ -222,6 +254,16 @@ channelFixture.workingActivity.phase = 'idle'
 channelFixture.workingActivity.line = ''
 channelFixture.version += 1
 for (const listener of listeners) listener()
+await waitFor('initial splash', () => splashCount() === 1)
+// LogoV2 keeps repainting its opening sequence for roughly 3.4 seconds. Start
+// the scrollback baseline only after both it and the working spinner are truly
+// settled; racing their frames can itself deposit a second splash while the
+// questionnaire opens or closes.
+await waitForOutputIdle('settled logo before multiline question')
+const settledSplashCount = splashCount()
+const settledSplashVisible = settledSplashCount >= 1
+console.log(`${settledSplashVisible ? 'PASS' : 'FAIL'}  settled startup splash is visible  (${settledSplashCount})`)
+if (!settledSplashVisible) failures += 1
 await waitFor('three-row status chrome before multiline question', () =>
   visibleText().includes('ctx 14%') && visibleText().includes('? 查看快捷键'))
 const multilineDraftLines = ['第一行 prompt', '第二行 prompt', '第三行 prompt', '第四行 prompt']
@@ -230,6 +272,7 @@ await waitFor('multiline prompt to become visible', () =>
   multilineDraftLines.every(line => visibleText().includes(line)))
 checkVisible('multiline prompt is visible before question', '第四行 prompt')
 initialBufferLength = term.buffer.active.length
+splashBeforeQuestion = splashCount()
 const scrollUpsBeforeQuestion = (rawChunks.join('').match(/\x1b\[\d+S/g) ?? []).length
 
 const answer = store.ask({
@@ -259,7 +302,7 @@ await waitFor('first questionnaire page', () => {
     && multilineDraftLines.every(line => !screen.includes(line))
 })
 await sleep(250)
-check('question opened')
+checkSplashNotIncreased('question opened')
 checkBufferStable('question open does not grow scrollback')
 checkVisible('first question remains visible', '使用哪个运行环境？')
 checkVisible('first question preserves status fields', 'ctx 14%')
@@ -277,7 +320,7 @@ await waitFor('second questionnaire page', () => {
     && multilineDraftLines.every(line => !screen.includes(line))
 })
 await sleep(250)
-check('advanced to second question')
+checkSplashNotIncreased('advanced to second question')
 checkBufferStable('question advance does not grow scrollback')
 checkVisible('second question remains visible', '继续执行吗？')
 checkVisible('second question preserves status fields', 'ctx 14%')
@@ -289,8 +332,8 @@ if (!secondQuestionHidesDraft) failures += 1
 stdin.write('\r')
 await answer
 await waitFor('questionnaire close and prompt restoration', () =>
-  multilineDraftLines.every(line => visibleText().includes(line)) && splashCount() === 1)
-check('questionnaire closed', true)
+  multilineDraftLines.every(line => visibleText().includes(line)))
+checkSplashNotIncreased('questionnaire closed', true)
 checkBufferStable('question close does not grow scrollback')
 const restoredDraft = multilineDraftLines.every(line => visibleText().includes(line))
 console.log(`${restoredDraft ? 'PASS' : 'FAIL'}  complete multiline prompt is restored after question`)
@@ -574,6 +617,14 @@ console.log(`${planActionableAfterResize ? 'PASS' : 'FAIL'}  resized plan review
 if (!planActionableAfterResize) failures += 1
 stdin.write('\x1b[B')
 await waitFor('second plan decision focus', () => visibleText().includes('❯2. 继续规划'))
+await resizeAndWait(40, 9, '40x9 one-row plan decision window')
+await waitFor('focused decision pointer wins over continuation marker', () =>
+  visibleText().includes('❯2. 继续规划') && !visibleText().includes('1. 批准计划'))
+const focusedDecisionKeepsPointer = visibleText().includes('❯2. 继续规划')
+  && !visibleText().includes('↑2. 继续规划')
+  && !visibleText().includes('1. 批准计划')
+console.log(`${focusedDecisionKeepsPointer ? 'PASS' : 'FAIL'}  one-row plan decision window keeps the focused pointer`)
+if (!focusedDecisionKeepsPointer) failures += 1
 stdin.write('\r')
 const planResult = await planOutcome
 const planSelected = planResult.answers.find(answer => answer.id === 'bounded-plan-review')?.selected ?? []
@@ -663,4 +714,42 @@ console.log(`${fullscreenSubmitted ? 'PASS' : 'FAIL'}  fullscreen resize submits
 if (!fullscreenSubmitted) failures += 1
 
 await app.unmount()
+
+// Standalone plan review has no scrollable plan viewport, so its help must not
+// advertise PageUp/PageDown. Render the component directly to cover the exact
+// layout branch rather than merely checking the translation table.
+const standaloneTerm = new XTerm({ cols: 100, rows: 24, scrollback: 100, allowProposedApi: true })
+const standaloneChunks: string[] = []
+const standaloneStdout = new FakeStdout(standaloneTerm, standaloneChunks) as FakeStdout & NodeJS.WriteStream
+const standaloneStdin = new FakeStdin() as FakeStdin & NodeJS.ReadStream
+const standaloneApp = await render(
+  <PlanReviewPanel
+    question={{
+      header: '独立计划评审',
+      question: '请选择下一步。',
+      detail: 'standalone detail',
+      options: [{ label: '批准计划' }, { label: '继续规划' }],
+      intent: { kind: 'plan-review', approve: '批准计划' },
+    }}
+    onAnswer={() => {}}
+    onCancel={() => {}}
+  />,
+  {
+    stdout: standaloneStdout,
+    stdin: standaloneStdin,
+    stderr: standaloneStdout,
+    exitOnCtrlC: false,
+    patchConsole: false,
+  },
+)
+const standaloneText = () => Array.from({ length: standaloneTerm.buffer.active.length }, (_, row) =>
+  standaloneTerm.buffer.active.getLine(row)?.translateToString(true) ?? '').join('\n')
+await waitFor('standalone plan review render', () => standaloneText().includes('Enter 提交'))
+const renderedStandaloneText = standaloneText()
+const standaloneHintIsAccurate = renderedStandaloneText.includes('Enter 提交')
+  && !renderedStandaloneText.includes('PgUp')
+  && !renderedStandaloneText.includes('PgDn')
+console.log(`${standaloneHintIsAccurate ? 'PASS' : 'FAIL'}  standalone plan review omits unavailable PageUp/PageDown help`)
+if (!standaloneHintIsAccurate) failures += 1
+await standaloneApp.unmount()
 process.exit(failures === 0 ? 0 : 1)
