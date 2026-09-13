@@ -769,18 +769,20 @@ export function Chat({
   const loadedContextVisible = channel.rows.length === 0 && channel.loadedContext !== undefined
   /** Startup context panel: collapsed by default, toggled with Ctrl+P. */
   const [loadedContextOpen, setLoadedContextOpen] = React.useState(false)
-  /**
-   * The context panel changes the height of the main-screen transcript by a
-   * large amount. In inline mode that invalidates the renderer's previous
-   * scrollback/layout correspondence; asking it to repaint from the physical
-   * viewport prevents the collapsed frame from reusing stale blank cells.
-   */
   const toggleLoadedContext = React.useCallback(() => {
     setLoadedContextOpen(previous => !previous)
+  }, [])
+  const renderedLoadedContextOpen = React.useRef(loadedContextOpen)
+  React.useLayoutEffect(() => {
+    if (renderedLoadedContextOpen.current === loadedContextOpen) return
+    renderedLoadedContextOpen.current = loadedContextOpen
+    // Reanchor after the new panel geometry commits. Requesting it in the
+    // key handler lets a pending paint consume it on the old tall layout,
+    // leaving the collapsed summary stranded outside the physical viewport.
     const ink = instances.get(process.stdout) ?? instances.values().next().value
     ink?.invalidatePrevFrame()
     ink?.reanchorViewport()
-  }, [])
+  }, [loadedContextOpen])
 
   /**
    * Click-to-act targets: the Ink instance's hyperlink-open callback (wired
