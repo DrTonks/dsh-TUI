@@ -98,7 +98,9 @@ export function ImagePreviewOverlay({
   // first open and as a blank transcript on every reopen).
   // Re-measure on every commit: the transcript row also changes height when
   // bottom-chrome rows (spinner, pill, panels) come and go, not only on
-  // terminal resize. setState with an equal box is a no-op, so this settles.
+  // terminal resize. Skip equal boxes before dispatch: returning previous
+  // from an updater can still schedule nested work when React has pending
+  // lanes, causing a maximum-update-depth crash (#870).
   const terminal = useTerminalSize()
   const { stdout } = useApp()
   React.useSyncExternalStore(subscribeLang, getLang)
@@ -126,10 +128,9 @@ export function ImagePreviewOverlay({
     const terminalRows = stdout.rows ?? terminal.rows
     const viewportTop = rootHeight > terminalRows ? rootHeight - terminalRows + 1 : 0
     const visibleHeight = Math.max(1, Math.min(height, bottom - viewportTop))
-    setBounds(previous =>
-      previous.columns === width && previous.rows === visibleHeight
-        ? previous
-        : { columns: width, rows: visibleHeight })
+    if (bounds.columns !== width || bounds.rows !== visibleHeight) {
+      setBounds({ columns: width, rows: visibleHeight })
+    }
   })
   const columns = bounds.columns
   const rows = bounds.rows

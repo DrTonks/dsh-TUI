@@ -865,6 +865,58 @@ function makeChannel() {
   } finally { stdout.isTTY = false; await app.unmount(); terminal.dispose() }
 }
 
+// #870: a fresh chat has no transcript rows. Keep terminal image probing
+// enabled and mirror the host's PageMargin in both presentation modes.
+for (const fullscreen of [false, true]) {
+  delete process.env.DSH_TUI_DISABLE_TERMINAL_IMAGES
+  const terminal = new XTerm({ cols: COLS, rows: ROWS, scrollback: 500, allowProposedApi: true })
+  const stdout = new FakeStdout(terminal)
+  const stdin = new FakeStdin()
+  const channel = makeChannel()
+  channel.rows = []
+  const imagePath = `${process.env.HOME}/fresh-preview.png`
+  writeFileSync(imagePath, png)
+  const chat = <ThemeProvider theme="dark"><PageMargin>
+    <Chat channel={channel as never} questionStore={new QuestionStore()} onExit={() => {}} fullscreen={fullscreen} />
+  </PageMargin></ThemeProvider>
+  const app = await render(fullscreen ? <AlternateScreen>{chat}</AlternateScreen> : chat,
+    { stdin: stdin as never, stdout: stdout as never, stderr: new FakeStderr() as never, exitOnCtrlC: false, patchConsole: false })
+  const screen = screenOf(terminal, ROWS)
+  const label = `fresh ${fullscreen ? 'fullscreen' : 'inline'}`
+  let frames = 0
+  stdout.onFrame = () => { frames += 1 }
+  try {
+    check(`${label}: ready`, await settled(() => screen.text().includes('model-00')))
+    stdin.write(`\x1b[200~${imagePath}\x1b[201~`)
+    check(`${label}: pasted image is staged`, await settled(() => screen.text().includes('[Image #1]')))
+    stdin.write('\x1b[D\x1b[D')
+    const previewVisible = () => screen.text().includes(' — PNG · ')
+    check(`${label}: left arrows open the caret preview`, await settled(previewVisible), screen.text())
+    stdin.write('\x1b[C\x1b[C')
+    check(`${label}: right arrows leave the preview`, await settled(() => !previewVisible()))
+    stdin.write('\x1b[D\x1b[D')
+    check(`${label}: left arrows reopen the preview`, await settled(previewVisible))
+    for (const [columns, rows] of [[50, 24], [120, 40], [80, 30]] as const) {
+      const beforeResize = frames
+      stdout.columns = columns
+      stdout.rows = rows
+      terminal.resize(columns, rows)
+      stdout.emit('resize')
+      check(`${label}: preview survives resize to ${columns}x${rows}`,
+        await settled(() => frames > beforeResize
+          && viewportLines(terminal, rows).join('\n').includes(' — PNG · ')))
+    }
+    stdin.write('\x1b')
+    check(`${label}: Esc closes the preview and retains the draft`,
+      await settled(() => !previewVisible() && screen.text().includes('[Image #1]')))
+  } finally {
+    stdout.isTTY = false
+    await app.unmount()
+    terminal.dispose()
+    process.env.DSH_TUI_DISABLE_TERMINAL_IMAGES = '1'
+  }
+}
+
 // Inline frames grow into scrollback. Center the preview in the visible
 // transcript tail, not in the full (potentially much taller) layout tree.
 for (const columns of [32, 80]) {
