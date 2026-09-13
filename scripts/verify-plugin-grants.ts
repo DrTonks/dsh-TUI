@@ -378,9 +378,10 @@ check1('decision permission map is immutable',
   hostCtx.logger.warn = (format: unknown, ...params: unknown[]) => {
     hostWarnings.push([format, ...params].map(String).join(' '))
   }
-  hostCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply })
-  await sleep(50)
+  const hostFiber = hostCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply })
+  await hostFiber.await()
   const service = hostCtx.get('tuiPluginHost')
+  await awaitInitialKernelReadiness(service, 'host descriptor fixture')
   check1('tuiPluginHost mounted', service !== undefined)
   if (service) {
     check1('generationId matches the descriptor schema pattern', /^[A-Za-z0-9._:-]+$/.test(service.generationId))
@@ -447,9 +448,9 @@ check1('decision permission map is immutable',
     withCommands.logger.warn = (format: unknown, ...params: unknown[]) => {
       withCommandsWarnings.push([format, ...params].map(String).join(' '))
     }
-    withCommands.plugin(FakeCommands)
-    withCommands.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply })
-    await sleep(50)
+    await withCommands.plugin(FakeCommands).await()
+    await withCommands.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply }).await()
+    await awaitInitialKernelReadiness(withCommands.get('tuiPluginHost'), 'mounted commands fixture')
     const descriptor = withCommands.get('tuiPluginHost')?.hostDescriptor()
     check1('Command not advertised as full support without execution probe',
       descriptor?.contracts.some(contract => contract.kind === 'Command') === false,
@@ -465,8 +466,8 @@ check1('decision permission map is immutable',
   {
     const partialCtx = new Context()
     partialCtx.logger.warn = () => undefined
-    partialCtx.plugin(pluginHostRow.TuiPluginHostRuntime)
-    await sleep(30)
+    await partialCtx.plugin(pluginHostRow.TuiPluginHostRuntime).await()
+    await awaitInitialKernelReadiness(partialCtx.get('tuiPluginHost'), 'partial host fixture')
     const descriptor = partialCtx.get('tuiPluginHost')?.hostDescriptor()
     check1('partial host excludes unmounted storage, observer, and guard-only DecisionEvents contracts',
       descriptor !== undefined
@@ -483,8 +484,8 @@ check1('decision permission map is immutable',
   {
     const admissionCtx = new Context()
     admissionCtx.logger.warn = () => undefined
-    admissionCtx.plugin(pluginHostRow.TuiPluginHostRuntime)
-    await sleep(30)
+    await admissionCtx.plugin(pluginHostRow.TuiPluginHostRuntime).await()
+    await awaitInitialKernelReadiness(admissionCtx.get('tuiPluginHost'), 'admission rejection fixture')
     const expectAdmissionRejection = async (
       ctx: InstanceType<typeof Context>,
       name: string,
@@ -677,9 +678,9 @@ check1('decision permission map is immutable',
   {
     const topologyCtx = new Context()
     topologyCtx.logger.warn = () => undefined
-    topologyCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply })
-    await sleep(50)
+    await topologyCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply }).await()
     const topologyHost = topologyCtx.get('tuiPluginHost')
+    await awaitInitialKernelReadiness(topologyHost, 'stale topology fixture')
     const staleBuild = topologyHost?.describe()
     check1('stale-topology fixture starts without DecisionEvents',
       staleBuild !== undefined && !staleBuild.descriptor.contracts.some(contract => contract.kind === 'DecisionEvents'),
@@ -751,9 +752,9 @@ check1('decision permission map is immutable',
       }
     }
     const dynamicCtx = new Context()
-    dynamicCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply })
-    await sleep(30)
+    await dynamicCtx.plugin({ name: pluginHostRow.name, apply: pluginHostRow.apply }).await()
     const dynamicHost = dynamicCtx.get('tuiPluginHost')
+    await awaitInitialKernelReadiness(dynamicHost, 'dynamic commands fixture')
     const withoutCommands = dynamicHost?.hostDescriptor()
     const commandsFiber = dynamicCtx.plugin(DynamicCommands)
     await sleep(30)
